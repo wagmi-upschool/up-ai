@@ -1,0 +1,15 @@
+{
+  "name": "upwagmitech-rag",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.682.0",
+    "@aws-sdk/lib-dynamodb": "^3.685.0",
+    "aws-sdk": "^2.1691.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "llamaindex": "^0.8.4"
+  }
+}
