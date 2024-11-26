@@ -50,11 +50,17 @@ async function initializeSettings(config) {
         setEnvs
     } = await import("@llamaindex/env");
     setEnvs(process.env);
+    console.log("test", process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME);
     Settings.llm = new OpenAI({
-        model: "gpt-4o",
-        deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-        additionalChatOptions: {
+        azure: {
+            endpoint: process.env.AZURE_OPENAI_ENDPOINT,
             deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+            apiKey: process.env.AZURE_OPENAI_KEY
+        },
+        model: "gpt-4o",
+        // deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+        additionalChatOptions: {
+            // deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
             // maxTokens: config.maxTokens,
             frequency_penalty: config.frequencyPenalty,
             presence_penalty: config.presencePenalty,
@@ -123,8 +129,6 @@ export async function handleReflection(req, res) {
         assistantId,
         type
     } = req.body;
-
-
 }
 
 // Controller to handle streaming reflection requests
@@ -136,6 +140,7 @@ export async function handleReflectionStream(req, res) {
     const {
         query,
         assistantId,
+        contextRole,
         type
     } = req.body;
 
@@ -177,11 +182,29 @@ export async function handleReflectionStream(req, res) {
         let stream;
         if (type == "chat") {
             const chatEngine = new ContextChatEngine({
+                llm: new OpenAI({
+
+                    azure: {
+                        endpoint: process.env.AZURE_OPENAI_ENDPOINT,
+                        deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+                        apiKey: process.env.AZURE_OPENAI_KEY
+                    },
+                    model: "gpt-4o",
+                    additionalChatOptions: {
+                        // maxTokens: config.maxTokens,
+                        frequency_penalty: assistantConfig.frequencyPenalty,
+                        presence_penalty: assistantConfig.presencePenalty,
+                        stream: assistantConfig.stream ? assistantConfig.stream : undefined
+                    },
+                    temperature: assistantConfig.temperature,
+                    topP: assistantConfig.topP,
+                    // maxTokens: config.maxTokens,
+                }),
                 retriever,
-                contextRole: "user"
+                contextRole: contextRole ?? "memory",
+                systemPrompt: replacedPatterns,
             });
             // Start the chat stream with the provided prompt
-            chatEngine.memory
             stream = await chatEngine.chat({
                 message: query,
                 stream: true
@@ -220,7 +243,9 @@ export async function handleReflectionStream(req, res) {
         res.setHeader('Content-Type', 'text/plain');
         res.setHeader('Transfer-Encoding', 'chunked');
         // Stream each chunk of the response
+        console.log("Stream Chunk: ");
         for await (const chunk of stream) {
+            console.log("Chunk: ", chunk);
             res.write(chunk.response);
         }
         // End the response after all chunks are sent
