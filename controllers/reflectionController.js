@@ -50,7 +50,6 @@ async function initializeSettings(config) {
         setEnvs
     } = await import("@llamaindex/env");
     setEnvs(process.env);
-    console.log("test", process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME);
     Settings.llm = new OpenAI({
         azure: {
             endpoint: process.env.AZURE_OPENAI_ENDPOINT,
@@ -243,9 +242,7 @@ export async function handleReflectionStream(req, res) {
         res.setHeader('Content-Type', 'text/plain');
         res.setHeader('Transfer-Encoding', 'chunked');
         // Stream each chunk of the response
-        console.log("Stream Chunk: ");
         for await (const chunk of stream) {
-            console.log("Chunk: ", chunk);
             res.write(chunk.response);
         }
         // End the response after all chunks are sent
