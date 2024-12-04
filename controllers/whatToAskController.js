@@ -214,6 +214,7 @@ export async function handleWhatToAskController(req, res) {
       combinedRetriever,
       responseSynthesizer
     );
+
     const query_ = `[System Prompts: 
             ${replacedPatterns}]
             -----------------------------------
@@ -221,6 +222,7 @@ export async function handleWhatToAskController(req, res) {
                 ${query}
             `;
 
+    console.log(query_);
     // Retrieve the result from queryEngine
     const result = await queryEngine.query({
       stream: true,
