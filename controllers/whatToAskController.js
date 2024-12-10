@@ -13,13 +13,20 @@ import {
 } from "llamaindex";
 import { GetCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-const dynamoDbClient = new DynamoDBClient({
-  region: "us-east-1",
-});
 import dotenv from "dotenv";
 
 // Load environment variables from .env file
 dotenv.config();
+
+const dynamoDbClient = new DynamoDBClient({
+  region: "us-east-1",
+});
+
+// Helper function for timing measurements
+function getTimeElapsed(startTime) {
+  const elapsed = process.hrtime(startTime);
+  return (elapsed[0] * 1000 + elapsed[1] / 1000000).toFixed(2); // Convert to milliseconds
+}
 
 // Function to remove patterns from text
 function replacePatterns(text) {
@@ -134,9 +141,12 @@ class CombinedRetriever {
   }
 
   async retrieve(query) {
+    const retrievalStartTime = process.hrtime();
     const results = await Promise.all(
       this.retrievers.map((retriever) => retriever.retrieve(query))
     );
+    const retrievalTime = getTimeElapsed(retrievalStartTime);
+    console.log("Combined retrieval time:", retrievalTime, "ms");
     return results.flat();
   }
 }
@@ -156,11 +166,28 @@ async function fetchAssistantConfig(assistantId) {
 
 // Controller to handle streaming reflection requests
 export async function handleWhatToAskController(req, res) {
+  const functionStartTime = process.hrtime();
+  console.log("Function started at:", new Date().toISOString());
+
   const { userId, conversationId } = req.params;
   const { query, assistantId, type } = req.body;
 
+  const timings = {
+    configFetch: 0,
+    initialization: 0,
+    indicesCreation: 0,
+    retrieversSetup: 0,
+    queryEngineSetup: 0,
+    totalSetup: 0,
+    firstResponseTime: 0,
+  };
+
   try {
+    // Timing: Config fetch
+    const configStartTime = process.hrtime();
     const systemMessage = await fetchAssistantConfig(assistantId);
+    timings.configFetch = getTimeElapsed(configStartTime);
+
     if (!systemMessage) throw new Error("Assistant configuration not found");
     const replacedPatterns = replacePatterns(systemMessage.prompt);
     const assistantConfig = {
@@ -172,13 +199,20 @@ export async function handleWhatToAskController(req, res) {
       responseType: "text",
       stream: true,
     };
-    await initializeSettings(assistantConfig);
 
-    // Create indices for both chat messages and assistant documents
+    // Timing: Initialization
+    const initStartTime = process.hrtime();
+    await initializeSettings(assistantConfig);
+    timings.initialization = getTimeElapsed(initStartTime);
+
+    // Timing: Indices creation
+    const indicesStartTime = process.hrtime();
     const { index_chat_messages, index_assistant_documents } =
       await createIndices();
+    timings.indicesCreation = getTimeElapsed(indicesStartTime);
 
-    // Create retrievers for both indices
+    // Timing: Retrievers setup
+    const retrieversStartTime = process.hrtime();
     const { retriever_chat, retriever_assistant } = createRetrievers(
       index_chat_messages,
       index_assistant_documents,
@@ -186,12 +220,14 @@ export async function handleWhatToAskController(req, res) {
       assistantId
     );
 
-    // Combine the retrievers
     const combinedRetriever = new CombinedRetriever([
       retriever_chat,
       retriever_assistant,
     ]);
+    timings.retrieversSetup = getTimeElapsed(retrieversStartTime);
 
+    // Timing: Query engine setup
+    const queryEngineStartTime = process.hrtime();
     const responseSynthesizer = await getResponseSynthesizer("tree_summarize", {
       llm: new OpenAI({
         azure: {
@@ -214,6 +250,7 @@ export async function handleWhatToAskController(req, res) {
       combinedRetriever,
       responseSynthesizer
     );
+    timings.queryEngineSetup = getTimeElapsed(queryEngineStartTime);
 
     const query_ = `[System Prompts: 
             ${replacedPatterns}]
@@ -222,30 +259,57 @@ export async function handleWhatToAskController(req, res) {
                 ${query}
             `;
 
-    console.log(query_);
-    // Retrieve the result from queryEngine
+    timings.totalSetup = getTimeElapsed(functionStartTime);
+
+    // Log all timings before streaming starts
+    console.log("Performance Metrics (ms):", {
+      ...timings,
+      timestamp: new Date().toISOString(),
+    });
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Transfer-Encoding", "chunked");
+
+    // Retrieve and stream the result
+    const streamStartTime = process.hrtime();
     const result = await queryEngine.query({
       stream: true,
       query: query_,
     });
 
-    res.setHeader("Content-Type", "text/plain");
-    res.setHeader("Transfer-Encoding", "chunked");
-
-    // Stream each chunk of the response
     if (result && typeof result[Symbol.asyncIterator] === "function") {
+      let isFirstChunk = true;
       for await (const chunk of result) {
+        if (isFirstChunk) {
+          timings.firstResponseTime = getTimeElapsed(streamStartTime);
+          console.log("Time to first chunk:", timings.firstResponseTime, "ms");
+          isFirstChunk = false;
+        }
+        console.log(chunk.response);
         res.write(chunk.response);
       }
+      const totalTime = getTimeElapsed(functionStartTime);
+      console.log("Stream completed. Total execution time:", totalTime, "ms");
+      res.write("[DONE-UP]");
       res.end();
     } else {
       // Handle non-async iterable response
+      const totalTime = getTimeElapsed(functionStartTime);
+      console.log(
+        "Non-streaming response completed. Total time:",
+        totalTime,
+        "ms"
+      );
+      res.write("[DONE-UP]");
       res.end(result.response || "No response");
     }
   } catch (err) {
+    const errorTime = getTimeElapsed(functionStartTime);
+    console.error("Error occurred after:", errorTime, "ms");
     console.error(err);
     res.status(500).json({
       error: err.message,
+      timings,
     });
   }
 }
