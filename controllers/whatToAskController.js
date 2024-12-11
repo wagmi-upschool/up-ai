@@ -4,9 +4,6 @@ import {
   VectorStoreIndex,
   Settings,
   OpenAIEmbedding,
-  ContextChatEngine,
-  SummaryIndex,
-  OpenAIContextAwareAgent,
   getResponseSynthesizer,
   RetrieverQueryEngine,
   VectorIndexRetriever,
@@ -15,20 +12,17 @@ import { GetCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import dotenv from "dotenv";
 
-// Load environment variables from .env file
 dotenv.config();
 
 const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
 });
 
-// Helper function for timing measurements
 function getTimeElapsed(startTime) {
   const elapsed = process.hrtime(startTime);
-  return (elapsed[0] * 1000 + elapsed[1] / 1000000).toFixed(2); // Convert to milliseconds
+  return (elapsed[0] * 1000 + elapsed[1] / 1000000).toFixed(2);
 }
 
-// Function to remove patterns from text
 function replacePatterns(text) {
   const signs = [
     "\\]\\*\\*\\*\\]",
@@ -43,7 +37,6 @@ function replacePatterns(text) {
   return text.replace(regex, "");
 }
 
-// Helper function to configure Azure options
 function getAzureEmbeddingOptions() {
   return {
     endpoint: process.env.AZURE_OPENAI_ENDPOINT,
@@ -52,7 +45,6 @@ function getAzureEmbeddingOptions() {
   };
 }
 
-// Initialize OpenAI settings based on assistant configuration
 async function initializeSettings(config) {
   const { setEnvs } = await import("@llamaindex/env");
   setEnvs(process.env);
@@ -74,7 +66,6 @@ async function initializeSettings(config) {
   });
 }
 
-// Create and return separate indices for chat messages and assistant documents
 async function createIndices() {
   const pcvs_chat = new PineconeVectorStore({
     indexName: "chat-messages",
@@ -96,26 +87,53 @@ async function createIndices() {
   return { index_chat_messages, index_assistant_documents };
 }
 
+class FallbackRetriever {
+  constructor(retrievers) {
+    this.retrievers = retrievers.filter((retriever) => retriever !== null);
+  }
+
+  async retrieve(query) {
+    let allResults = [];
+
+    for (const retriever of this.retrievers) {
+      try {
+        const results = await retriever.retrieve(query);
+        if (results && results.length > 0) {
+          allResults = allResults.concat(results);
+        }
+      } catch (error) {
+        console.warn(`Retriever error: ${error.message}`);
+        // Continue to next retriever
+      }
+    }
+
+    return allResults;
+  }
+}
+
 function createRetrievers(
   index_chat_messages,
   index_assistant_documents,
   conversationId,
   assistantId
 ) {
-  const retriever_chat = new VectorIndexRetriever({
-    index: index_chat_messages,
-    includeValues: true,
-    filters: {
-      filters: [
-        {
-          key: "conversationId",
-          value: conversationId,
-          operator: "==",
+  // Only create chat retriever if conversationId exists
+  const retriever_chat = conversationId
+    ? new VectorIndexRetriever({
+        index: index_chat_messages,
+        includeValues: true,
+        filters: {
+          filters: [
+            {
+              key: "conversationId",
+              value: conversationId,
+              operator: "==",
+            },
+          ],
         },
-      ],
-    },
-    similarityTopK: 100,
-  });
+        similarityTopK: 100,
+      })
+    : null;
 
   const retriever_assistant = new VectorIndexRetriever({
     index: index_assistant_documents,
@@ -135,23 +153,6 @@ function createRetrievers(
   return { retriever_chat, retriever_assistant };
 }
 
-class CombinedRetriever {
-  constructor(retrievers) {
-    this.retrievers = retrievers;
-  }
-
-  async retrieve(query) {
-    const retrievalStartTime = process.hrtime();
-    const results = await Promise.all(
-      this.retrievers.map((retriever) => retriever.retrieve(query))
-    );
-    const retrievalTime = getTimeElapsed(retrievalStartTime);
-    console.log("Combined retrieval time:", retrievalTime, "ms");
-    return results.flat();
-  }
-}
-
-// Fetch assistant configuration from DynamoDB
 async function fetchAssistantConfig(assistantId) {
   const env = process.env.STAGE;
   const params = {
@@ -164,10 +165,8 @@ async function fetchAssistantConfig(assistantId) {
   return result.Item ? result.Item : null;
 }
 
-// Controller to handle streaming reflection requests
 export async function handleWhatToAskController(req, res) {
   const functionStartTime = process.hrtime();
-  console.log("Function started at:", new Date().toISOString());
 
   const { userId, conversationId } = req.params;
   const { query, assistantId, type } = req.body;
@@ -183,7 +182,6 @@ export async function handleWhatToAskController(req, res) {
   };
 
   try {
-    // Timing: Config fetch
     const configStartTime = process.hrtime();
     const systemMessage = await fetchAssistantConfig(assistantId);
     timings.configFetch = getTimeElapsed(configStartTime);
@@ -200,18 +198,15 @@ export async function handleWhatToAskController(req, res) {
       stream: true,
     };
 
-    // Timing: Initialization
     const initStartTime = process.hrtime();
     await initializeSettings(assistantConfig);
     timings.initialization = getTimeElapsed(initStartTime);
 
-    // Timing: Indices creation
     const indicesStartTime = process.hrtime();
     const { index_chat_messages, index_assistant_documents } =
       await createIndices();
     timings.indicesCreation = getTimeElapsed(indicesStartTime);
 
-    // Timing: Retrievers setup
     const retrieversStartTime = process.hrtime();
     const { retriever_chat, retriever_assistant } = createRetrievers(
       index_chat_messages,
@@ -220,13 +215,12 @@ export async function handleWhatToAskController(req, res) {
       assistantId
     );
 
-    const combinedRetriever = new CombinedRetriever([
-      retriever_chat,
-      retriever_assistant,
-    ]);
+    // Create array of retrievers, excluding null retrievers
+    const retrievers = [retriever_chat, retriever_assistant].filter(Boolean);
+
+    const fallbackRetriever = new FallbackRetriever(retrievers);
     timings.retrieversSetup = getTimeElapsed(retrieversStartTime);
 
-    // Timing: Query engine setup
     const queryEngineStartTime = process.hrtime();
     const responseSynthesizer = await getResponseSynthesizer("tree_summarize", {
       llm: new OpenAI({
@@ -247,7 +241,7 @@ export async function handleWhatToAskController(req, res) {
     });
 
     const queryEngine = new RetrieverQueryEngine(
-      combinedRetriever,
+      fallbackRetriever,
       responseSynthesizer
     );
     timings.queryEngineSetup = getTimeElapsed(queryEngineStartTime);
@@ -261,7 +255,6 @@ export async function handleWhatToAskController(req, res) {
 
     timings.totalSetup = getTimeElapsed(functionStartTime);
 
-    // Log all timings before streaming starts
     console.log("Performance Metrics (ms):", {
       ...timings,
       timestamp: new Date().toISOString(),
@@ -270,7 +263,6 @@ export async function handleWhatToAskController(req, res) {
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Transfer-Encoding", "chunked");
 
-    // Retrieve and stream the result
     const streamStartTime = process.hrtime();
     const result = await queryEngine.query({
       stream: true,
@@ -285,7 +277,6 @@ export async function handleWhatToAskController(req, res) {
           console.log("Time to first chunk:", timings.firstResponseTime, "ms");
           isFirstChunk = false;
         }
-        console.log(chunk.response);
         res.write(chunk.response);
       }
       const totalTime = getTimeElapsed(functionStartTime);
@@ -293,7 +284,6 @@ export async function handleWhatToAskController(req, res) {
       res.write("[DONE-UP]");
       res.end();
     } else {
-      // Handle non-async iterable response
       const totalTime = getTimeElapsed(functionStartTime);
       console.log(
         "Non-streaming response completed. Total time:",

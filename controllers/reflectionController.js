@@ -115,21 +115,6 @@ async function fetchAssistantConfig(assistantId) {
   return result.Item ? result.Item : null;
 }
 
-// Helper function to handle stream chunks
-async function handleStreamChunk(chunk, res) {
-  if (!chunk) return;
-
-  if (typeof chunk === "string") {
-    res.write(chunk);
-  } else if (chunk.response) {
-    res.write(chunk.response);
-  } else if (chunk.text) {
-    res.write(chunk.text);
-  } else if (chunk.content) {
-    res.write(chunk.content);
-  }
-}
-
 // Helper function to create OpenAI instance
 function createOpenAIInstance(config) {
   return new OpenAI({
@@ -149,10 +134,71 @@ function createOpenAIInstance(config) {
   });
 }
 
-export async function handleReflection(req, res) {}
-// Controller to handle streaming reflection requests
-// ... (previous imports and helper functions remain the same)
+// Helper function to safely process and write stream chunks
+async function processStreamChunk(chunk, res, hasWrittenContent) {
+  if (!chunk) return hasWrittenContent;
 
+  try {
+    let content = "";
+
+    if (typeof chunk === "string") {
+      content = chunk;
+    } else if (chunk.response) {
+      content = String(chunk.response);
+    } else if (chunk.text) {
+      content = String(chunk.text);
+    } else if (chunk.content) {
+      content = String(chunk.content);
+    } else if (typeof chunk.toString === "function") {
+      content = chunk.toString();
+    }
+
+    if (content && content.trim()) {
+      res.write(content);
+      return true;
+    }
+  } catch (error) {
+    console.error("Error processing chunk:", error, "Chunk:", chunk);
+  }
+
+  return hasWrittenContent;
+}
+
+// Helper function for direct LLM responses
+async function getDirectLLMResponse(query, systemPrompt, llm) {
+  console.log("Using direct LLM response as vector store is empty");
+  try {
+    const response = await llm.chat({
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt,
+        },
+        {
+          role: "user",
+          content: query,
+        },
+      ],
+    });
+
+    // Return a proper streaming format
+    return {
+      [Symbol.asyncIterator]: async function* () {
+        const content =
+          response.text ||
+          response.response ||
+          response.content ||
+          response.toString();
+        yield { response: String(content) };
+      },
+    };
+  } catch (error) {
+    console.error("Error in direct LLM response:", error);
+    throw error;
+  }
+}
+
+// Controller to handle streaming reflection requests
 export async function handleReflectionStream(req, res) {
   const functionStartTime = process.hrtime();
   console.log("Function started at:", new Date().toISOString());
@@ -177,7 +223,6 @@ export async function handleReflectionStream(req, res) {
     timings.configFetch = getTimeElapsed(configStartTime);
 
     if (!systemMessage) throw new Error("Assistant configuration not found");
-    console.log("System message retrieved:", { prompt: systemMessage.prompt });
 
     const replacedPatterns = replacePatterns(systemMessage.prompt);
     const assistantConfig = {
@@ -189,156 +234,116 @@ export async function handleReflectionStream(req, res) {
       responseType: "text",
       stream: true,
     };
-    console.log("Assistant config:", assistantConfig);
 
     // Initialization timing
     const initStartTime = process.hrtime();
     await initializeSettings(assistantConfig);
     timings.initialization = getTimeElapsed(initStartTime);
 
-    // Index creation timing
-    const indexStartTime = process.hrtime();
-    const index = await createIndex(conversationId);
-    const retriever = await createRetriever(
-      index,
-      conversationId,
-      type || "default"
-    );
-    timings.indexCreation = getTimeElapsed(indexStartTime);
+    // Create LLM instance
+    const llm = createOpenAIInstance(assistantConfig);
 
-    // Set headers
+    // Set response headers
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Transfer-Encoding", "chunked");
 
     try {
       const streamSetupTime = process.hrtime();
       let response;
+      let hasWrittenContent = false;
 
-      // Create OpenAI instance with explicit configurations
-      const llm = new OpenAI({
-        azure: {
-          endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-          deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-          apiKey: process.env.AZURE_OPENAI_KEY,
-        },
-        model: "gpt-4o",
-        additionalChatOptions: {
-          frequency_penalty: assistantConfig.frequencyPenalty,
-          presence_penalty: assistantConfig.presencePenalty,
-          stream: true,
-        },
-        temperature: assistantConfig.temperature,
-        topP: assistantConfig.topP,
-      });
-
-      // Get response synthesizer
-      const responseSynthesizer = await getResponseSynthesizer(
-        "tree_summarize",
-        {
-          llm,
-        }
+      // Create index and check vector store
+      const index = await createIndex(conversationId);
+      const retriever = await createRetriever(
+        index,
+        conversationId,
+        type || "default"
       );
+      const testResults = await retriever.retrieve(query);
 
-      // Create query engine
-      const queryEngine = new RetrieverQueryEngine(
-        retriever,
-        responseSynthesizer
-      );
+      if (testResults.length === 0) {
+        // No vector store results, use direct LLM
+        response = await getDirectLLMResponse(query, replacedPatterns, llm);
+      } else {
+        // Use vector store results
+        const responseSynthesizer = await getResponseSynthesizer(
+          "tree_summarize",
+          { llm }
+        );
+        const queryEngine = new RetrieverQueryEngine(
+          retriever,
+          responseSynthesizer
+        );
 
-      console.log("Preparing query with system prompt");
-      const query_ = `[System Prompts: 
+        const query_ = `[System Prompts: 
             ${replacedPatterns}]
             -----------------------------------
             User Query:
                 ${query}
             `;
-      console.log("Final query:", query_);
 
-      // Get response
-      console.log("Executing query...");
-      response = await queryEngine.query({
-        stream: true,
-        query: query_,
-      });
+        response = await queryEngine.query({
+          stream: false, // Changed to false to handle streaming manually
+          query: query_,
+        });
+      }
 
       timings.streamSetup = getTimeElapsed(streamSetupTime);
       timings.totalSetup = getTimeElapsed(functionStartTime);
 
-      console.log("Performance Metrics (ms):", {
-        ...timings,
-        timestamp: new Date().toISOString(),
-      });
-
       if (!response) {
-        throw new Error("No response received from the query engine");
+        throw new Error("No response received from the engine");
       }
 
-      // Handle Promise-like responses
-      if (response.then) {
-        console.log("Resolving Promise response");
-        response = await response;
-        console.log("Promise resolved:", { responseType: typeof response });
-      }
-
-      let hasWrittenContent = false;
-      let isFirstChunk = true;
-      const streamStartTime = process.hrtime();
-
-      if (response.response) {
-        // Single response
-        console.log("Single response received");
-        res.write(response.response);
-        hasWrittenContent = true;
-      } else if (response[Symbol.asyncIterator]) {
-        // Stream response
-        console.log("Processing stream response");
-        for await (const chunk of response) {
-          if (isFirstChunk) {
-            timings.firstChunk = getTimeElapsed(streamStartTime);
-            console.log(
-              "First chunk received after:",
-              timings.firstChunk,
-              "ms"
-            );
-            console.log("First chunk content:", chunk);
-            isFirstChunk = false;
-          }
-
-          if (chunk) {
-            if (typeof chunk === "string") {
-              console.log("Writing string chunk");
-              res.write(chunk);
-              hasWrittenContent = true;
-            } else if (chunk.response) {
-              console.log("Writing response chunk");
-              res.write(chunk.response);
-              hasWrittenContent = true;
-            } else if (chunk.text) {
-              console.log("Writing text chunk");
-              res.write(chunk.text);
-              hasWrittenContent = true;
-            } else if (chunk.content) {
-              console.log("Writing content chunk");
-              res.write(chunk.content);
-              hasWrittenContent = true;
-            } else {
-              console.log("Received chunk with unknown format:", chunk);
-            }
-          }
-        }
+      // Process the response
+      if (typeof response === "object" && response.response) {
+        // Handle single response object
+        hasWrittenContent = await processStreamChunk(
+          response,
+          res,
+          hasWrittenContent
+        );
       } else if (typeof response === "string") {
-        // Direct string response
-        console.log("Writing direct string response");
-        res.write(response);
-        hasWrittenContent = true;
-      } else {
-        console.log("Unexpected response type:", typeof response, response);
-        throw new Error(`Unexpected response type: ${typeof response}`);
+        // Handle direct string response
+        hasWrittenContent = await processStreamChunk(
+          response,
+          res,
+          hasWrittenContent
+        );
+      } else if (response[Symbol.asyncIterator]) {
+        // Handle streaming response
+        for await (const chunk of response) {
+          hasWrittenContent = await processStreamChunk(
+            chunk,
+            res,
+            hasWrittenContent
+          );
+        }
       }
 
+      // Use fallback if no content was written
       if (!hasWrittenContent) {
-        console.log("No content was written to the response");
-        res.write("No response generated. Please try again.");
+        const fallbackResponse = await llm.chat({
+          messages: [
+            {
+              role: "system",
+              content: replacedPatterns,
+            },
+            {
+              role: "user",
+              content: query,
+            },
+          ],
+        });
+
+        const fallbackText = String(
+          fallbackResponse.text ||
+            fallbackResponse.response ||
+            fallbackResponse.content ||
+            "I apologize, but I couldn't generate a response. Please try rephrasing your question."
+        );
+
+        res.write(fallbackText);
       }
 
       const totalTime = getTimeElapsed(functionStartTime);
@@ -347,15 +352,8 @@ export async function handleReflectionStream(req, res) {
       res.write("[DONE-UP]");
       res.end();
     } catch (streamError) {
-      console.error("Streaming error details:", {
-        error: streamError,
-        type: streamError.constructor.name,
-        message: streamError.message,
-        stack: streamError.stack,
-      });
-
+      console.error("Streaming error:", streamError);
       const errorTime = getTimeElapsed(functionStartTime);
-      console.log("Stream error occurred after:", errorTime, "ms");
 
       if (!res.headersSent) {
         res.status(500).json({
@@ -372,13 +370,7 @@ export async function handleReflectionStream(req, res) {
     }
   } catch (err) {
     const errorTime = getTimeElapsed(functionStartTime);
-    console.error("General error details:", {
-      error: err,
-      type: err.constructor.name,
-      message: err.message,
-      stack: err.stack,
-    });
-    console.log("Error occurred after:", errorTime, "ms");
+    console.error("General error:", err);
 
     if (!res.headersSent) {
       res.status(500).json({
