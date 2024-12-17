@@ -73,12 +73,20 @@ async function createIndices() {
     indexName: "chat-messages",
     chunkSize: 100,
     storesText: true,
+    embeddingModel: new OpenAIEmbedding({
+      model: "text-embedding-3-small",
+      azure: getAzureEmbeddingOptions(),
+    }),
   });
 
   const pcvs_assistant = new PineconeVectorStore({
     indexName: "assistant-documents",
     chunkSize: 100,
     storesText: true,
+    embeddingModel: new OpenAIEmbedding({
+      model: "text-embedding-3-small",
+      azure: getAzureEmbeddingOptions(),
+    }),
   });
 
   const index_chat_messages = await VectorStoreIndex.fromVectorStore(pcvs_chat);
@@ -89,28 +97,8 @@ async function createIndices() {
   return { index_chat_messages, index_assistant_documents };
 }
 
-function createRetrievers(
-  index_chat_messages,
-  index_assistant_documents,
-  conversationId,
-  assistantId
-) {
-  const retriever_chat = new VectorIndexRetriever({
-    index: index_chat_messages,
-    includeValues: true,
-    filters: {
-      filters: [
-        {
-          key: "conversationId",
-          value: conversationId,
-          operator: "==",
-        },
-      ],
-    },
-    similarityTopK: 100,
-  });
-
-  const retriever_assistant = new VectorIndexRetriever({
+function createAssistantRetriever({ index_assistant_documents, assistantId }) {
+  return new VectorIndexRetriever({
     index: index_assistant_documents,
     includeValues: true,
     filters: {
@@ -124,8 +112,22 @@ function createRetrievers(
     },
     similarityTopK: 100,
   });
-
-  return { retriever_chat, retriever_assistant };
+}
+function createChatRetriever({ index_chat_messages, conversationId }) {
+  return new VectorIndexRetriever({
+    index: index_chat_messages,
+    includeValues: true,
+    filters: {
+      filters: [
+        {
+          key: "conversationId",
+          value: conversationId,
+          operator: "==",
+        },
+      ],
+    },
+    similarityTopK: 100,
+  });
 }
 
 class CombinedRetriever {
@@ -178,19 +180,31 @@ export async function handleWhatToAskController(req, res) {
     const { index_chat_messages, index_assistant_documents } =
       await createIndices();
 
-    // Create retrievers for both indices
-    const { retriever_chat, retriever_assistant } = createRetrievers(
-      index_chat_messages,
-      index_assistant_documents,
-      conversationId,
-      assistantId
-    );
+    const retriever_chat = createChatRetriever({
+      index_chat_messages: index_chat_messages,
+      conversationId: conversationId,
+    });
+
+    const retriever_assistant = createAssistantRetriever({
+      index_assistant_documents: index_assistant_documents,
+      assistantId: assistantId,
+    });
 
     // Combine the retrievers
-    const combinedRetriever = new CombinedRetriever([
-      retriever_chat,
-      retriever_assistant,
-    ]);
+    const combinedRetriever =
+      conversationId == null
+        ? new CombinedRetriever([retriever_assistant])
+        : new CombinedRetriever([retriever_chat, retriever_assistant]);
+
+    // console.log(retriever_chat);
+    // console.log(retriever_chat.filters);
+    // console.log(retriever_chat.filters.filters);
+
+    // console.log(retriever_assistant);
+    // console.log(retriever_assistant.filters);
+    // console.log(retriever_assistant.filters.filters);
+
+    console.log(await combinedRetriever.retrieve("networking"));
 
     const responseSynthesizer = await getResponseSynthesizer("tree_summarize", {
       llm: new OpenAI({
@@ -222,7 +236,7 @@ export async function handleWhatToAskController(req, res) {
                 ${query}
             `;
 
-    console.log(query_);
+    console.log();
     // Retrieve the result from queryEngine
     const result = await queryEngine.query({
       stream: true,
@@ -235,8 +249,10 @@ export async function handleWhatToAskController(req, res) {
     // Stream each chunk of the response
     if (result && typeof result[Symbol.asyncIterator] === "function") {
       for await (const chunk of result) {
+        console.log(chunk.response);
         res.write(chunk.response);
       }
+      res.write("[DONE-UP]");
       res.end();
     } else {
       // Handle non-async iterable response
