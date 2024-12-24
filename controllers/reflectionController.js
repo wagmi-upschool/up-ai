@@ -227,6 +227,7 @@ export async function handleReflectionStream(req, res) {
       //console.log("queryEngine", queryEngine);
 
       const query_ = `[System Prompts: 
+            ${replacedPatterns}]
             -----------------------------------
             User Query:
                 ${query}
