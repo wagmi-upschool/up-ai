@@ -8,8 +8,10 @@ import {
   RetrieverQueryEngine,
   VectorIndexRetriever,
 } from "llamaindex";
-import { GetCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { v4 as uuidv4 } from "uuid";
+import { countTokens } from "gpt-tokenizer/model/gpt-4o-mini";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -22,6 +24,25 @@ const dynamoDbClient = new DynamoDBClient({
 function getTimeElapsed(startTime) {
   const elapsed = process.hrtime(startTime);
   return (elapsed[0] * 1000 + elapsed[1] / 1000000).toFixed(2);
+}
+
+// Save token data to DynamoDB
+async function saveTokenData(userId, type, amount, conversationId, stage) {
+  const timestamp = new Date().toISOString();
+  const params = {
+    TableName: `ConsumedToken-${stage}`,
+    Item: {
+      id: uuidv4(),
+      userId,
+      conversationId,
+      type,
+      amount,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+  };
+  console.log(params);
+  await dynamoDbClient.send(new PutCommand(params));
 }
 
 // Function to remove patterns from text
@@ -149,6 +170,16 @@ export async function handleReflectionStream(req, res) {
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Transfer-Encoding", "chunked");
 
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+
+    // Count tokens from system message and user query
+    totalInputTokens += countTokens(replacedPatterns);
+    totalInputTokens += countTokens(query);
+    if (latestMessage) {
+      totalInputTokens += countTokens(latestMessage);
+    }
+
     let response;
     const index = await createIndex(conversationId);
     const retriever = await createRetriever(index, conversationId);
@@ -173,6 +204,7 @@ export async function handleReflectionStream(req, res) {
       });
 
       console.log(latestMessage);
+      let fullOutput = "";
       const response = await llm.chat({
         messages: [
           {
@@ -192,9 +224,11 @@ export async function handleReflectionStream(req, res) {
       });
 
       for await (const chunk of response) {
-        //console.log(chunk.delta);
-        res.write(chunk.delta);
+        const content = chunk.delta;
+        fullOutput += content;
+        res.write(content);
       }
+      totalOutputTokens = countTokens(fullOutput);
     } else {
       console.log("Using responseSynthesizer");
       const responseSynthesizer = await getResponseSynthesizer(
@@ -218,13 +252,10 @@ export async function handleReflectionStream(req, res) {
         }
       );
 
-      //console.log("responseSynthesizer", responseSynthesizer);
-
       const queryEngine = new RetrieverQueryEngine(
         retriever,
         responseSynthesizer
       );
-      //console.log("queryEngine", queryEngine);
 
       const query_ = `[System Prompts: 
             ${replacedPatterns}]
@@ -233,16 +264,43 @@ export async function handleReflectionStream(req, res) {
                 ${query}
             `;
 
+      let fullOutput = "";
       response = await queryEngine.query({
         query: query_,
         stream: true,
       });
 
       for await (const chunk of response) {
-        //console.log(chunk.delta);
-        res.write(chunk.delta);
+        const content = chunk.delta;
+        fullOutput += content;
+        res.write(content);
       }
+      totalOutputTokens = countTokens(fullOutput);
     }
+
+    // Save token usage data
+    await saveTokenData(
+      userId,
+      "input",
+      totalInputTokens,
+      conversationId,
+      stage
+    );
+    await saveTokenData(
+      userId,
+      "output",
+      totalOutputTokens,
+      conversationId,
+      stage
+    );
+
+    console.log(
+      userId,
+      "Token usage - Input:",
+      totalInputTokens,
+      "Output:",
+      totalOutputTokens
+    );
 
     res.write("[DONE-UP]");
     res.end();
