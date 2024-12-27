@@ -41,7 +41,6 @@ async function saveTokenData(userId, type, amount, conversationId, stage) {
       updatedAt: timestamp,
     },
   };
-  console.log(params);
   await dynamoDbClient.send(new PutCommand(params));
 }
 
@@ -97,6 +96,14 @@ async function createIndex(conversationId) {
     storesText: true,
   });
   return await VectorStoreIndex.fromVectorStore(pcvs);
+}
+
+// Function to count embedding tokens
+async function countEmbeddingTokens(text) {
+  // cl100k_base is the tokenizer used by text-embedding-3-small
+  const { encoding_for_model } = await import("tiktoken");
+  const encoding = await encoding_for_model("text-embedding-3-small");
+  return encoding.encode(text).length;
 }
 
 function createRetriever(index, conversationId) {
@@ -184,6 +191,41 @@ export async function handleReflectionStream(req, res) {
     const index = await createIndex(conversationId);
     const retriever = await createRetriever(index, conversationId);
     const testResults = await retriever.retrieve(query);
+
+    // Count embedding tokens for the query
+    const queryEmbeddingTokens = await countEmbeddingTokens(query);
+
+    // Count embedding tokens for retrieved nodes
+    let retrievedNodesTokens = 0;
+    if (testResults && testResults.length > 0) {
+      retrievedNodesTokens = await testResults.reduce(
+        async (totalPromise, result) => {
+          const total = await totalPromise;
+          // Check if result has node and text property
+          if (result.node && result.node.text) {
+            const tokens = await countEmbeddingTokens(result.node.text);
+            return total + tokens;
+          }
+          return total;
+        },
+        Promise.resolve(0)
+      );
+    }
+
+    // Add only query embedding tokens to total input tokens
+    totalInputTokens += queryEmbeddingTokens;
+
+    // Log token usage for debugging
+    console.log(
+      "Embedding tokens - Query:",
+      queryEmbeddingTokens,
+      "Retrieved:",
+      retrievedNodesTokens
+    );
+    console.log(
+      "Total input tokens (including query embeddings):",
+      totalInputTokens
+    );
 
     if (testResults.length == 0) {
       console.log("Using direct LLM response");
@@ -295,7 +337,6 @@ export async function handleReflectionStream(req, res) {
     );
 
     console.log(
-      userId,
       "Token usage - Input:",
       totalInputTokens,
       "Output:",
