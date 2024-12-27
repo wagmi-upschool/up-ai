@@ -13,7 +13,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { v4 as uuidv4 } from "uuid";
 import { countTokens } from "gpt-tokenizer/model/gpt-4o-mini";
 import dotenv from "dotenv";
-
+import { CognitoJwtVerifier } from "aws-jwt-verify";
 dotenv.config();
 
 const dynamoDbClient = new DynamoDBClient({
@@ -41,6 +41,7 @@ async function saveTokenData(userId, type, amount, conversationId, stage) {
       updatedAt: timestamp,
     },
   };
+  console.log(params);
   await dynamoDbClient.send(new PutCommand(params));
 }
 
@@ -138,6 +139,30 @@ async function fetchAssistantConfig(assistantId, stage) {
 export async function handleReflectionStream(req, res) {
   const functionStartTime = process.hrtime();
   console.log("Function started at:", new Date().toISOString());
+  const poolId = process.env.POOL_ID;
+
+  // Dynamically import and initialize JWT verifier
+  let userEmail;
+  try {
+    if (!req.headers.authorization) {
+      throw new Error("Token not found.");
+    }
+
+    const verifier = CognitoJwtVerifier.create({
+      userPoolId: poolId,
+      tokenUse: "id",
+      clientId: null,
+    });
+
+    const token = req.headers.authorization.split(" ")[1];
+    const payload = await verifier.verify(token);
+    userEmail = payload.email;
+    console.log("Token verified for user:", userEmail);
+  } catch (error) {
+    console.error("Token verification error:", error);
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
 
   const { userId, conversationId } = req.params;
   const { query, assistantId, latestMessage, stage } = req.body;
@@ -322,14 +347,14 @@ export async function handleReflectionStream(req, res) {
 
     // Save token usage data
     await saveTokenData(
-      userId,
+      userEmail,
       "input",
       totalInputTokens,
       conversationId,
       stage
     );
     await saveTokenData(
-      userId,
+      userEmail,
       "output",
       totalOutputTokens,
       conversationId,
