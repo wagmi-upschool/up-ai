@@ -52,7 +52,7 @@ async function initializeSettings(config) {
   const { setEnvs } = await import("@llamaindex/env");
   setEnvs(process.env);
   Settings.llm = new OpenAI({
-    model: "gpt-4o",
+    model: process.env.MODEL,
     deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
     additionalChatOptions: {
       deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
@@ -180,7 +180,7 @@ export async function handleLLMStream(req, res) {
           deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
           apiKey: process.env.AZURE_OPENAI_KEY,
         },
-        model: "gpt-4o",
+        model: process.env.MODEL,
         additionalChatOptions: {
           frequency_penalty: assistantConfig.frequencyPenalty,
           presence_penalty: assistantConfig.presencePenalty,
@@ -223,7 +223,7 @@ export async function handleLLMStream(req, res) {
               deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
               apiKey: process.env.AZURE_OPENAI_KEY,
             },
-            model: "gpt-4o",
+            model: process.env.MODEL,
             additionalChatOptions: {
               frequency_penalty: assistantConfig.frequencyPenalty,
               presence_penalty: assistantConfig.presencePenalty,

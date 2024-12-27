@@ -27,7 +27,7 @@ async function initializeSettings(config) {
   setEnvs(process.env); // Set environment variables for LlamaIndex
 
   Settings.llm = new OpenAI({
-    model: "gpt-4o",
+    model: process.env.MODEL,
     deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
     additionalChatOptions: {
       deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
