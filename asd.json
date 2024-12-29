@@ -1,0 +1,42 @@
+{
+  "topAssistantsIds": {
+    "lastUpdatedAt": "2024-12-29T06:42:01.938Z",
+    "ids": [
+      "4b88c4d7-f88d-471f-b5e5-7f52d137cace",
+      "4edebe53-5663-4e36-bb73-4b5696c168ca",
+      "f805853e-ffea-4549-aeb3-697fa5861c2b",
+      "a52ac10b-9771-4276-b320-ef0bf677d470"
+    ],
+    "title": "UP ile gelişim yolculuğun başlasın!"
+  },
+  "assistantGroupIdsInNewChat": {
+    "lastUpdatedAt": "2024-12-26T15:38:44.102Z",
+    "ids": [
+      "7c68ad5d-6092-4a4a-98bc-235e4553e332",
+      "f2b835b2-139a-4ea4-a9a0-930d6baded6a",
+      "86261033-dfa1-4196-8334-50592cb6490f",
+      "06261033-dfa1-4196-8334-50592cb6490f"
+    ]
+  },
+  "assistantGroupIds": {
+    "lastUpdatedAt": "2024-12-28T06:42:01.938Z",
+    "ids": [
+      "7c68ad5d-6092-4a4a-98bc-235e4553e332",
+      "06261033-dfa1-4196-8334-50592cb6490f",
+      "f2b835b2-139a-4ea4-a9a0-930d6baded6a",
+      "86261033-dfa1-4196-8334-50592cb6490f",
+      "4a4a-98bc-235e4553e332-7c68ad5d-6092",
+      "06261033-dfa1-50592cb6490f-4196-8334"
+    ]
+  },
+  "bottomAssistantsIds": {
+    "lastUpdatedAt": "2024-12-28T06:42:01.938Z",
+    "ids": [
+      "0777e23c-c4f7-4cd2-88cf-3f5136eee9b2",
+      "ca33604c-0e0f-4130-b16e-e05676f63976",
+      "97729d8e-b722-4822-9490-a900cec81260",
+      "d80184f3-876b-4701-87e7-ad374418eb15"
+    ],
+    "title": "UP ile gelişim yolculuğun başlasın!"
+  }
+}

@@ -30,7 +30,7 @@ function getTimeElapsed(startTime) {
 async function saveTokenData(userId, type, amount, conversationId, stage) {
   const timestamp = new Date().toISOString();
   const params = {
-    TableName: `ConsumedToken-${stage}`,
+    TableName: `ConsumedToken-${stage ?? process.env.STAGE ?? "upwagmitec"}`,
     Item: {
       id: uuidv4(),
       userId,
