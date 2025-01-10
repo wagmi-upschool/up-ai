@@ -1,16 +1,16 @@
-import {
-  OpenAI,
-  PineconeVectorStore,
-  VectorStoreIndex,
-  Settings,
-  OpenAIEmbedding,
-  getResponseSynthesizer,
-  RetrieverQueryEngine,
-  VectorIndexRetriever,
-} from "llamaindex";
+/**
+ * @fileoverview Controller for handling chat interactions with LLM
+ */
+
+import { OpenAI } from "llamaindex";
 import { GetCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import dotenv from "dotenv";
+import { DocumentIndexer } from "../lib/rag/documentIndexer.js";
+import { RAGQueryEngine } from "../lib/query-engine/ragQueryEngine.js";
+import { VectorStoreService } from "../lib/vector-store/vectorStoreService.js";
+import { TokenCounter } from "../lib/token-management/tokenCounter.js";
+import { initPinecone } from "../config/pinecone.js";
 
 dotenv.config();
 
@@ -18,13 +18,11 @@ const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
 });
 
-// Helper function for timing measurements
-function getTimeElapsed(startTime) {
-  const elapsed = process.hrtime(startTime);
-  return (elapsed[0] * 1000 + elapsed[1] / 1000000).toFixed(2);
-}
-
-// Function to remove patterns from text
+/**
+ * Removes specific patterns from text
+ * @param {string} text - The text to process
+ * @returns {string} The processed text with patterns removed
+ */
 function replacePatterns(text) {
   const signs = [
     "\\]\\*\\*\\*\\]",
@@ -39,62 +37,12 @@ function replacePatterns(text) {
   return text.replace(regex, "");
 }
 
-// Helper function to configure Azure options
-function getAzureEmbeddingOptions() {
-  return {
-    endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-    deployment: "text-embedding-3-small",
-    apiKey: process.env.AZURE_OPENAI_KEY,
-  };
-}
-
-async function initializeSettings(config) {
-  const { setEnvs } = await import("@llamaindex/env");
-  setEnvs(process.env);
-  Settings.llm = new OpenAI({
-    model: process.env.MODEL,
-    deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-    additionalChatOptions: {
-      deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-      frequency_penalty: config.frequencyPenalty,
-      presence_penalty: config.presencePenalty,
-      stream: true,
-    },
-    temperature: config.temperature,
-    topP: config.topP,
-  });
-  Settings.embedModel = new OpenAIEmbedding({
-    model: "text-embedding-3-small",
-    azure: getAzureEmbeddingOptions(),
-  });
-}
-
-async function createIndex(conversationId) {
-  const pcvs = new PineconeVectorStore({
-    indexName: "chat-messages",
-    chunkSize: 100,
-    storesText: true,
-  });
-  return await VectorStoreIndex.fromVectorStore(pcvs);
-}
-
-function createRetriever(index, conversationId) {
-  return new VectorIndexRetriever({
-    index: index,
-    includeValues: true,
-    filters: {
-      filters: [
-        {
-          key: "conversationId",
-          value: conversationId,
-          operator: "==",
-        },
-      ],
-    },
-    similarityTopK: 100,
-  });
-}
-
+/**
+ * Fetches assistant configuration from DynamoDB
+ * @param {string} assistantId - The ID of the assistant
+ * @returns {Promise<Object|null>} The assistant configuration or null if not found
+ * @throws {Error} If DynamoDB operation fails
+ */
 async function fetchAssistantConfig(assistantId) {
   const env = process.env.STAGE;
   const params = {
@@ -104,169 +52,100 @@ async function fetchAssistantConfig(assistantId) {
     },
   };
   const result = await dynamoDbClient.send(new GetCommand(params));
-  return result.Item ? result.Item : null;
+  return result.Item ?? null;
 }
 
-async function processStreamChunk(chunk) {
-  try {
-    let content = "";
-
-    if (typeof chunk === "string") {
-      content = chunk;
-    } else if (chunk.response) {
-      content = String(chunk.response);
-    } else if (chunk.text) {
-      content = String(chunk.text);
-    } else if (chunk.content) {
-      content = String(chunk.content);
-    } else if (typeof chunk.toString === "function") {
-      content = chunk.toString();
-    }
-
-    if (content && content.trim()) {
-      return content;
-    }
-  } catch (error) {
-    console.error("Error processing chunk:", error, "Chunk:", chunk);
-  }
-}
-
+/**
+ * Handles LLM stream requests and responses
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ * @throws {Error} If processing fails
+ */
 export async function handleLLMStream(req, res) {
-  const functionStartTime = process.hrtime();
-  console.log("Function started at:", new Date().toISOString());
-
-  const { userId, conversationId } = req.params;
-  const { query, assistantId } = req.body;
-
-  const timings = {
-    configFetch: 0,
-    initialization: 0,
-    streamSetup: 0,
-    totalSetup: 0,
-  };
-
   try {
-    const configStartTime = process.hrtime();
+    const { userId, conversationId } = req.params;
+    const { query, assistantId } = req.body;
+
+    // Initialize services
+    const pineconeClient = await initPinecone();
+    const vectorStoreService = new VectorStoreService();
+    const documentIndexer = new DocumentIndexer(pineconeClient);
+    const tokenCounter = new TokenCounter();
+
+    // Fetch assistant configuration
     const systemMessage = await fetchAssistantConfig(assistantId);
-    timings.configFetch = getTimeElapsed(configStartTime);
+    if (!systemMessage) {
+      throw new Error("Assistant configuration not found");
+    }
 
-    if (!systemMessage) throw new Error("Assistant configuration not found");
-
-    const replacedPatterns = replacePatterns(systemMessage.prompt);
+    // Process system message
+    const systemPrompt = replacePatterns(systemMessage.prompt);
     const assistantConfig = {
       temperature: parseFloat(systemMessage.temperature) || 0.2,
       topP: parseFloat(systemMessage.topP) || 0.95,
       maxTokens: parseInt(systemMessage.maxTokens) || 800,
       frequencyPenalty: parseFloat(systemMessage.frequencyPenalty) || 0.0,
       presencePenalty: parseFloat(systemMessage.presencePenalty) || 0.0,
-      responseType: "text",
       stream: true,
     };
 
-    const initStartTime = process.hrtime();
-    await initializeSettings(assistantConfig);
-    timings.initialization = getTimeElapsed(initStartTime);
-
+    // Set up response headers
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Transfer-Encoding", "chunked");
 
-    let response;
+    // Count input tokens
+    tokenCounter.addInputTokens(systemPrompt, query);
 
-    if (conversationId === "null" || !conversationId) {
-      console.log("Using direct LLM response");
-      const llm = new OpenAI({
-        azure: {
-          endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-          deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-          apiKey: process.env.AZURE_OPENAI_KEY,
-        },
-        model: process.env.MODEL,
-        additionalChatOptions: {
-          frequency_penalty: assistantConfig.frequencyPenalty,
-          presence_penalty: assistantConfig.presencePenalty,
-          stream: false,
-        },
-        temperature: assistantConfig.temperature,
-        topP: assistantConfig.topP,
-      });
+    // Create vector stores
+    const chatStore = vectorStoreService.createChatMessagesStore();
+    const assistantStore = vectorStoreService.createAssistantDocumentsStore();
 
-      const response = await llm.chat({
-        messages: [
-          {
-            role: "system",
-            content: replacedPatterns,
-          },
-          {
-            role: "user",
-            content: query,
-          },
-        ],
-        stream: true,
-      });
+    // Initialize query engine with appropriate store
+    const queryEngine = new RAGQueryEngine(
+      conversationId ? chatStore : assistantStore,
+      assistantConfig
+    );
 
-      for await (const chunk of response) {
-        res.write(chunk.delta);
-      }
+    // Set up filters based on conversation/assistant ID
+    const filters = conversationId ? { conversationId } : { assistantId };
 
-      console.log(response);
-    } else {
-      console.log("Using retriever response");
-      const index = await createIndex(conversationId);
-      const retriever = await createRetriever(index, conversationId);
-
-      const responseSynthesizer = await getResponseSynthesizer(
-        "tree_summarize",
+    // Process query
+    const response = await queryEngine.query({
+      query: query,
+      stream: true,
+      messages: [
         {
-          llm: new OpenAI({
-            azure: {
-              endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-              deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-              apiKey: process.env.AZURE_OPENAI_KEY,
-            },
-            model: process.env.MODEL,
-            additionalChatOptions: {
-              frequency_penalty: assistantConfig.frequencyPenalty,
-              presence_penalty: assistantConfig.presencePenalty,
-              stream: true,
-            },
-            temperature: assistantConfig.temperature,
-            topP: assistantConfig.topP,
-          }),
-        }
-      );
+          role: "system",
+          content: systemPrompt,
+        },
+      ],
+    });
 
-      const queryEngine = new RetrieverQueryEngine(
-        retriever,
-        responseSynthesizer
-      );
-
-      const query_ = `[System Prompts: 
-            ${replacedPatterns}]
-            -----------------------------------
-            User Query:
-                ${query}
-            `;
-
-      response = await queryEngine.query({
-        query: query_,
-        stream: true,
-      });
-
-      for await (const chunk of response) {
-        res.write(chunk.delta);
+    let fullOutput = "";
+    for await (const chunk of response) {
+      const content = chunk?.delta?.trim();
+      if (content) {
+        fullOutput += content;
+        res.write(content);
       }
     }
+
+    // Count and save token usage
+    tokenCounter.addOutputTokens(fullOutput);
+    await tokenCounter.saveTokenUsage({
+      userId,
+      conversationId,
+      stage: process.env.STAGE,
+    });
+
     res.write("[DONE-UP]");
     res.end();
-  } catch (err) {
-    console.error("Error in handleLLMStream:", err);
-    const errorTime = getTimeElapsed(functionStartTime);
+  } catch (error) {
+    console.error("Error in handleLLMStream:", error);
 
     if (!res.headersSent) {
       res.status(500).json({
-        error: err.message,
-        timings,
-        errorTime,
+        error: error.message,
       });
     } else {
       res.write("\n[ERROR] Streaming interrupted");

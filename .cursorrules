@@ -1,0 +1,141 @@
+{
+  "javascript": {
+    "formatter": {
+      "indentSize": 2,
+      "lineWidth": 80,
+      "quoteStyle": "double",
+      "trailingComma": "es5",
+      "semicolons": true
+    },
+    "linter": {
+      "rules": {
+        "import/prefer-default-export": "off",
+        "import/extensions": [
+          "error",
+          "always",
+          {
+            "js": "never"
+          }
+        ],
+        "no-await-in-loop": "warn",
+        "require-await": "error",
+        "no-console": [
+          "error",
+          {
+            "allow": [
+              "error",
+              "warn",
+              "info"
+            ]
+          }
+        ],
+        "no-throw-literal": "error",
+        "camelcase": [
+          "error",
+          {
+            "properties": "never"
+          }
+        ],
+        "max-len": [
+          "error",
+          {
+            "code": 80,
+            "ignoreComments": true
+          }
+        ],
+        "no-unused-vars": [
+          "error",
+          {
+            "argsIgnorePattern": "^_"
+          }
+        ],
+        "no-undef": "error",
+        "no-unused-expressions": "error",
+        "require-jsdoc": [
+          "error",
+          {
+            "require": {
+              "FunctionDeclaration": true,
+              "MethodDefinition": true,
+              "ClassDeclaration": true
+            }
+          }
+        ],
+        "no-param-reassign": "error",
+        "prefer-const": "error",
+        "no-eval": "error",
+        "no-implied-eval": "error"
+      }
+    }
+  },
+  "patterns": {
+    "controllers": {
+      "path": "controllers/*.js",
+      "rules": {
+        "function-naming": {
+          "pattern": "^handle[A-Z][a-zA-Z]+$",
+          "message": "Controller function names should start with 'handle'"
+        },
+        "file-naming": {
+          "pattern": "^[a-z]+Controller\\.js$",
+          "message": "Controller files should end with 'Controller.js'"
+        }
+      }
+    },
+    "services": {
+      "path": "services/*.js",
+      "rules": {
+        "function-naming": {
+          "pattern": "^[a-z][a-zA-Z]+Service$",
+          "message": "Service function names should end with 'Service'"
+        }
+      }
+    }
+  },
+  "imports": {
+    "preferred": {
+      "llamaindex": [
+        "OpenAI",
+        "VectorStoreIndex",
+        "Document"
+      ],
+      "@aws-sdk/client-dynamodb": [
+        "DynamoDBClient"
+      ],
+      "@aws-sdk/lib-dynamodb": [
+        "GetCommand",
+        "PutCommand"
+      ],
+      "dotenv": [
+        "config"
+      ]
+    }
+  },
+  "security": {
+    "required": {
+      "files": [
+        "controllers/*.js"
+      ],
+      "patterns": [
+        "try\\s*{[^}]+}\\s*catch",
+        "process\\.env\\.",
+        "await\\s+[^;]+"
+      ]
+    }
+  },
+  "documentation": {
+    "required": {
+      "files": [
+        "controllers/*.js",
+        "services/*.js"
+      ],
+      "jsdoc": {
+        "tags": [
+          "@param",
+          "@returns",
+          "@throws"
+        ]
+      }
+    }
+  }
+}
