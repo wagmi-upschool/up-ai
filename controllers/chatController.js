@@ -95,8 +95,8 @@ function createRetriever(index, conversationId) {
   });
 }
 
-async function fetchAssistantConfig(assistantId) {
-  const env = process.env.STAGE;
+async function fetchAssistantConfig(assistantId, stage) {
+  const env = stage ?? process.env.STAGE;
   const params = {
     TableName: `UpAssistant-${env}`,
     Key: {
@@ -136,7 +136,8 @@ export async function handleLLMStream(req, res) {
   console.log("Function started at:", new Date().toISOString());
 
   const { userId, conversationId } = req.params;
-  const { query, assistantId } = req.body;
+  const { query, assistantId, stage } = req.body;
+  console.log(stage);
 
   const timings = {
     configFetch: 0,
@@ -147,7 +148,7 @@ export async function handleLLMStream(req, res) {
 
   try {
     const configStartTime = process.hrtime();
-    const systemMessage = await fetchAssistantConfig(assistantId);
+    const systemMessage = await fetchAssistantConfig(assistantId, stage);
     timings.configFetch = getTimeElapsed(configStartTime);
 
     if (!systemMessage) throw new Error("Assistant configuration not found");

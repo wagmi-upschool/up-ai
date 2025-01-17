@@ -144,8 +144,8 @@ class CombinedRetriever {
 }
 
 // Fetch assistant configuration from DynamoDB
-async function fetchAssistantConfig(assistantId) {
-  const env = process.env.STAGE;
+async function fetchAssistantConfig(assistantId, stage) {
+  const env = stage ?? process.env.STAGE;
   const params = {
     TableName: `UpAssistant-${env}`,
     Key: {
@@ -159,10 +159,10 @@ async function fetchAssistantConfig(assistantId) {
 // Controller to handle streaming reflection requests
 export async function handleWhatToAskController(req, res) {
   const { userId, conversationId } = req.params;
-  const { query, assistantId, type } = req.body;
+  const { query, assistantId, type, stage } = req.body;
 
   try {
-    const systemMessage = await fetchAssistantConfig(assistantId);
+    const systemMessage = await fetchAssistantConfig(assistantId, stage);
     if (!systemMessage) throw new Error("Assistant configuration not found");
     const replacedPatterns = replacePatterns(systemMessage.prompt);
     const assistantConfig = {
