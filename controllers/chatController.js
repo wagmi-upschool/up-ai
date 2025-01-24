@@ -137,7 +137,18 @@ export async function handleLLMStream(req, res) {
 
   const { userId, conversationId } = req.params;
   const { query, assistantId, stage } = req.body;
-  console.log(stage);
+  console.log(
+    "userId:",
+    userId,
+    "conversationId:",
+    conversationId,
+    "query:",
+    query,
+    "assistantId:",
+    assistantId,
+    "stage:",
+    stage
+  );
 
   const timings = {
     configFetch: 0,
@@ -170,10 +181,19 @@ export async function handleLLMStream(req, res) {
 
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Transfer-Encoding", "chunked");
+    let results = [];
+    let index = null;
+    let retriever = null;
+    if (conversationId) {
+      index = await createIndex(conversationId);
+      retriever = await createRetriever(index, conversationId);
+      results = await retriever.retrieve(query);
+      console.log("Retrieved results:", results);
+    }
 
     let response;
 
-    if (conversationId === "null" || !conversationId) {
+    if (conversationId === "null" || !conversationId || results.length === 0) {
       console.log("Using direct LLM response");
       const llm = new OpenAI({
         azure: {
@@ -212,8 +232,6 @@ export async function handleLLMStream(req, res) {
       console.log(response);
     } else {
       console.log("Using retriever response");
-      const index = await createIndex(conversationId);
-      const retriever = await createRetriever(index, conversationId);
 
       const responseSynthesizer = await getResponseSynthesizer(
         "tree_summarize",
@@ -241,21 +259,18 @@ export async function handleLLMStream(req, res) {
         responseSynthesizer
       );
 
-      const query_ = `[System Prompts: 
-            ${replacedPatterns}]
-            -----------------------------------
-            User Query:
-                ${query}
-            `;
-
       response = await queryEngine.query({
-        query: query_,
+        query: query,
         stream: true,
       });
 
+      console.log(response);
+      let fullOutput = "";
       for await (const chunk of response) {
+        fullOutput += chunk.delta;
         res.write(chunk.delta);
       }
+      console.log("Full output:", fullOutput);
     }
     res.write("[DONE-UP]");
     res.end();
