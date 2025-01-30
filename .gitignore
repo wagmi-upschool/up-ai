@@ -3,3 +3,4 @@ package-lock.json
 .dev.vars
 .DS_Store
 .env
+exports/
