@@ -5,8 +5,9 @@
   "main": "index.js",
   "type": "module",
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.682.0",
-    "@aws-sdk/lib-dynamodb": "^3.685.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.738.0",
+    "@aws-sdk/client-dynamodb": "^3.738.0",
+    "@aws-sdk/lib-dynamodb": "^3.738.0",
     "@fast-csv/format": "^5.0.2",
     "@llamaindex/pinecone": "^0.0.1",
     "@pinecone-database/pinecone": "^4.0.0",

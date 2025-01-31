@@ -79,7 +79,7 @@ const analyzeUsers = async (userPoolId) => {
       ).toFixed(2)}%)`
     );
 
-    return stats;
+    return { stats, users };
   } catch (error) {
     console.error("Error analyzing users:", error);
     throw error;
@@ -88,10 +88,10 @@ const analyzeUsers = async (userPoolId) => {
 
 // Main function
 async function main() {
-  const poolId = "us-east-1_tTejiiLwi"; // Your Cognito User Pool ID
+  const poolId = process.env.POOL_ID;
 
   if (!poolId) {
-    console.error("Error: User Pool ID is not set");
+    console.error("Error: User Pool ID is not set in environment variables");
     process.exit(1);
   }
 
