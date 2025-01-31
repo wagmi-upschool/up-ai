@@ -69,18 +69,55 @@ async function initializeSettings(config) {
   });
 }
 
-async function createIndex(conversationId) {
-  const pcvs = new PineconeVectorStore({
+async function createIndices() {
+  const pcvs_chat = new PineconeVectorStore({
     indexName: "chat-messages",
     chunkSize: 100,
     storesText: true,
+    embeddingModel: new OpenAIEmbedding({
+      model: "text-embedding-3-small",
+      azure: getAzureEmbeddingOptions(),
+    }),
   });
-  return await VectorStoreIndex.fromVectorStore(pcvs);
+
+  const pcvs_assistant = new PineconeVectorStore({
+    indexName: "assistant-documents",
+    chunkSize: 100,
+    storesText: true,
+    embeddingModel: new OpenAIEmbedding({
+      model: "text-embedding-3-small",
+      azure: getAzureEmbeddingOptions(),
+    }),
+  });
+
+  const index_chat_messages = await VectorStoreIndex.fromVectorStore(pcvs_chat);
+  const index_assistant_documents = await VectorStoreIndex.fromVectorStore(
+    pcvs_assistant
+  );
+
+  return { index_chat_messages, index_assistant_documents };
 }
 
-function createRetriever(index, conversationId) {
+function createAssistantRetriever({ index_assistant_documents, assistantId }) {
   return new VectorIndexRetriever({
-    index: index,
+    index: index_assistant_documents,
+    includeValues: true,
+    filters: {
+      filters: [
+        {
+          key: "assistantId",
+          value: assistantId,
+          operator: "==",
+        },
+      ],
+    },
+    similarityTopK: 100,
+  });
+}
+
+function createChatRetriever({ index_chat_messages, conversationId }) {
+  return new VectorIndexRetriever({
+    index: index_chat_messages,
     includeValues: true,
     filters: {
       filters: [
@@ -95,6 +132,19 @@ function createRetriever(index, conversationId) {
   });
 }
 
+class CombinedRetriever {
+  constructor(retrievers) {
+    this.retrievers = retrievers;
+  }
+
+  async retrieve(query) {
+    const results = await Promise.all(
+      this.retrievers.map((retriever) => retriever.retrieve(query))
+    );
+    return results.flat();
+  }
+}
+
 async function fetchAssistantConfig(assistantId, stage) {
   const env = stage ?? process.env.STAGE;
   const params = {
@@ -105,30 +155,6 @@ async function fetchAssistantConfig(assistantId, stage) {
   };
   const result = await dynamoDbClient.send(new GetCommand(params));
   return result.Item ? result.Item : null;
-}
-
-async function processStreamChunk(chunk) {
-  try {
-    let content = "";
-
-    if (typeof chunk === "string") {
-      content = chunk;
-    } else if (chunk.response) {
-      content = String(chunk.response);
-    } else if (chunk.text) {
-      content = String(chunk.text);
-    } else if (chunk.content) {
-      content = String(chunk.content);
-    } else if (typeof chunk.toString === "function") {
-      content = chunk.toString();
-    }
-
-    if (content && content.trim()) {
-      return content;
-    }
-  } catch (error) {
-    console.error("Error processing chunk:", error, "Chunk:", chunk);
-  }
 }
 
 export async function handleLLMStream(req, res) {
@@ -181,19 +207,39 @@ export async function handleLLMStream(req, res) {
 
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Transfer-Encoding", "chunked");
-    let results = [];
-    let index = null;
-    let retriever = null;
+
+    // Create indices for both chat messages and assistant documents
+    const { index_chat_messages, index_assistant_documents } =
+      await createIndices();
+
+    let retrievers = [];
+
+    // Add chat retriever if we have a conversation ID
     if (conversationId) {
-      index = await createIndex(conversationId);
-      retriever = await createRetriever(index, conversationId);
-      results = await retriever.retrieve(query);
-      console.log("Retrieved results:", results);
+      const retriever_chat = createChatRetriever({
+        index_chat_messages,
+        conversationId,
+      });
+      retrievers.push(retriever_chat);
     }
 
-    let response;
+    // Add assistant retriever if we have an assistant ID
+    if (assistantId) {
+      const retriever_assistant = createAssistantRetriever({
+        index_assistant_documents,
+        assistantId,
+      });
+      retrievers.push(retriever_assistant);
+    }
 
-    if (conversationId === "null" || !conversationId || results.length === 0) {
+    // Create combined retriever
+    const combinedRetriever = new CombinedRetriever(retrievers);
+
+    // Get results from all retrievers
+    const results = await combinedRetriever.retrieve(query);
+    console.log("Retrieved results:", results);
+
+    if (!conversationId || conversationId === "null" || results.length === 0) {
       console.log("Using direct LLM response");
       const llm = new OpenAI({
         azure: {
@@ -255,7 +301,7 @@ export async function handleLLMStream(req, res) {
       );
 
       const queryEngine = new RetrieverQueryEngine(
-        retriever,
+        combinedRetriever,
         responseSynthesizer
       );
 
