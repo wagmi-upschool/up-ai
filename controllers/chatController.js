@@ -213,6 +213,7 @@ export async function handleLLMStream(req, res) {
       await createIndices();
 
     let retrievers = [];
+    let response;
 
     // Add chat retriever if we have a conversation ID
     if (conversationId) {
