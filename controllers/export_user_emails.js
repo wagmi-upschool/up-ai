@@ -122,7 +122,7 @@ async function main() {
   const config = {
     userPoolId: poolId,
     region: process.env.AWS_REGION || "us-east-1",
-    outputFile: "./cognito_users.csv",
+    outputFile: "./exports/cognito_users.csv",
   };
 
   try {
