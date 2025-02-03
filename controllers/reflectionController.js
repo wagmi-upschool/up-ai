@@ -140,6 +140,7 @@ export async function handleReflectionStream(req, res) {
   const functionStartTime = process.hrtime();
   console.log("Function started at:", new Date().toISOString());
   const poolId = process.env.POOL_ID;
+  const { query, assistantId, latestMessage, stage } = req.body;
 
   // Dynamically import and initialize JWT verifier
   let userEmail;
@@ -149,7 +150,7 @@ export async function handleReflectionStream(req, res) {
     }
 
     const verifier = CognitoJwtVerifier.create({
-      userPoolId: poolId,
+      userPoolId: stage === "myenv" ? "us-east-1_akkBktCUt" : poolId,
       tokenUse: "id",
       clientId: null,
     });
@@ -165,7 +166,6 @@ export async function handleReflectionStream(req, res) {
   }
 
   const { userId, conversationId } = req.params;
-  const { query, assistantId, latestMessage, stage } = req.body;
 
   const timings = {
     configFetch: 0,
