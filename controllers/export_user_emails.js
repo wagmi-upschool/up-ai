@@ -2,7 +2,6 @@ import AWS from "aws-sdk";
 import fs from "fs";
 import { format } from "@fast-csv/format";
 import dotenv from "dotenv";
-
 // Load environment variables
 dotenv.config();
 
@@ -10,30 +9,6 @@ dotenv.config();
 const configureAWS = (region = "us-east-1") => {
   AWS.config.update({ region });
   return new AWS.CognitoIdentityServiceProvider();
-};
-
-// Get all users from Cognito User Pool
-const getAllUsers = async (cognito, userPoolId) => {
-  const users = [];
-  let paginationToken = null;
-
-  try {
-    do {
-      const params = {
-        UserPoolId: userPoolId,
-        ...(paginationToken && { PaginationToken: paginationToken }),
-      };
-
-      const response = await cognito.listUsers(params).promise();
-      users.push(...response.Users);
-      paginationToken = response.PaginationToken;
-    } while (paginationToken);
-
-    return users;
-  } catch (error) {
-    console.error("Error fetching users:", error);
-    throw error;
-  }
 };
 
 // Extract email from user attributes
@@ -45,53 +20,62 @@ const extractEmail = (user) => {
 // Process users and prepare for CSV export
 const processUsersForExport = (users) => {
   return users
-    .map((user) => ({
-      email: extractEmail(user),
-      username: user.Username,
-      status: user.UserStatus,
-      createdDate: user.UserCreateDate.toISOString().split("T")[0],
-      lastModified: user.UserLastModifiedDate.toISOString().split("T")[0],
-    }))
-    .filter((user) => user.email); // Only include users with email addresses
+    .map((user) => {
+      // Ensure date is in YYYY-MM-DD format
+      const createdDate = new Date(user.UserCreateDate)
+        .toISOString()
+        .split("T")[0];
+      const lastModified = new Date(user.UserLastModifiedDate)
+        .toISOString()
+        .split("T")[0];
+
+      return {
+        email: extractEmail(user),
+        username: user.Username,
+        status: user.UserStatus,
+        createdDate,
+        lastModified,
+      };
+    })
+    .filter((user) => user.email) // Only include users with email addresses
+    .sort((a, b) => {
+      // Explicit descending sort (newest dates first)
+      if (a.createdDate > b.createdDate) return -1;
+      if (a.createdDate < b.createdDate) return 1;
+      return 0;
+    });
 };
 
-// Export users to CSV
-const exportToCSV = async (users, outputFile) => {
+// Process a batch of users
+const processBatch = async (users, outputFile, isFirstBatch) => {
+  const processedUsers = processUsersForExport(users);
+
+  // For first batch, create new file with headers
+  const writeOptions = {
+    headers: isFirstBatch,
+    includeEndRowDelimiter: true,
+    writeHeaders: isFirstBatch,
+    append: !isFirstBatch,
+  };
+
   return new Promise((resolve, reject) => {
     try {
-      // Ensure directory exists
       const directory = outputFile.split("/").slice(0, -1).join("/");
       if (directory && !fs.existsSync(directory)) {
         fs.mkdirSync(directory, { recursive: true });
       }
 
-      const writeStream = fs.createWriteStream(outputFile);
-      const csvStream = format({
-        headers: ["email", "username", "status", "createdDate", "lastModified"],
-        quoteColumns: true,
+      const writeStream = fs.createWriteStream(outputFile, {
+        flags: isFirstBatch ? "w" : "a",
       });
+      const csvStream = format(writeOptions);
 
-      writeStream.on("finish", () => {
-        console.log(
-          `Successfully exported ${users.length} users to ${outputFile}`
-        );
-        resolve();
-      });
-
-      writeStream.on("error", (error) => {
-        console.error("Error writing to CSV:", error);
-        reject(error);
-      });
-
-      csvStream.on("error", (error) => {
-        console.error("Error in CSV stream:", error);
-        reject(error);
-      });
-
+      writeStream.on("finish", resolve);
+      writeStream.on("error", reject);
+      csvStream.on("error", reject);
       csvStream.pipe(writeStream);
 
-      // Write each user record
-      users.forEach((user) => {
+      processedUsers.forEach((user) => {
         csvStream.write({
           email: user.email || "",
           username: user.username || "",
@@ -103,10 +87,98 @@ const exportToCSV = async (users, outputFile) => {
 
       csvStream.end();
     } catch (error) {
-      console.error("Error in exportToCSV:", error);
       reject(error);
     }
   });
+};
+
+// Get all users from Cognito User Pool
+const getAllUsers = async (cognito, userPoolId, outputFile) => {
+  const BATCH_SIZE = 50; // Adjust this value based on your needs
+  let totalUsers = 0;
+  let paginationToken = null;
+  let isFirstBatch = true;
+
+  try {
+    do {
+      const params = {
+        UserPoolId: userPoolId,
+        Limit: BATCH_SIZE,
+        ...(paginationToken && { PaginationToken: paginationToken }),
+      };
+
+      console.log(`Fetching batch of up to ${BATCH_SIZE} users...`);
+      const response = await cognito.listUsers(params).promise();
+
+      if (response.Users.length > 0) {
+        console.log(`Processing batch of ${response.Users.length} users...`);
+        await processBatch(response.Users, outputFile, isFirstBatch);
+        totalUsers += response.Users.length;
+        console.log(`Processed ${totalUsers} users so far...`);
+      }
+
+      paginationToken = response.PaginationToken;
+      isFirstBatch = false;
+    } while (paginationToken);
+
+    console.log(`Completed processing all ${totalUsers} users`);
+    return totalUsers;
+  } catch (error) {
+    console.error("Error fetching users:", error);
+    throw error;
+  }
+};
+
+// Add this function before the exports
+const exportToCSV = async (users, outputFile) => {
+  try {
+    const processedUsers = processUsersForExport(users);
+
+    // Create directory if it doesn't exist
+    const directory = outputFile.split("/").slice(0, -1).join("/");
+    if (directory && !fs.existsSync(directory)) {
+      fs.mkdirSync(directory, { recursive: true });
+    }
+
+    const writeStream = fs.createWriteStream(outputFile);
+    const csvStream = format({
+      headers: true,
+      includeEndRowDelimiter: true,
+    });
+
+    return new Promise((resolve, reject) => {
+      writeStream.on("finish", () => {
+        // Add logging after file is written
+        if (fs.existsSync(outputFile)) {
+          const stats = fs.statSync(outputFile);
+          console.log("CSV file successfully created!");
+          console.log(`File path: ${outputFile}`);
+          console.log(`File size: ${stats.size} bytes`);
+          console.log(`Number of users exported: ${processedUsers.length}`);
+        }
+        resolve();
+      });
+      writeStream.on("error", reject);
+      csvStream.on("error", reject);
+
+      csvStream.pipe(writeStream);
+
+      processedUsers.forEach((user) => {
+        csvStream.write({
+          email: user.email || "",
+          username: user.username || "",
+          status: user.status || "",
+          createdDate: user.createdDate || "",
+          lastModified: user.lastModified || "",
+        });
+      });
+
+      csvStream.end();
+    });
+  } catch (error) {
+    console.error("Error exporting to CSV:", error);
+    throw error;
+  }
 };
 
 // Main function
@@ -129,18 +201,14 @@ async function main() {
     // Initialize Cognito client
     const cognito = configureAWS(config.region);
 
-    // Get all users
+    // Get and process users in batches
     console.log(`Fetching users from User Pool ${config.userPoolId}...`);
-    const users = await getAllUsers(cognito, config.userPoolId);
-    console.log(`Found ${users.length} users`);
-
-    // Process users for export
-    const processedUsers = processUsersForExport(users);
-    console.log(`Processing ${processedUsers.length} users for export...`);
-
-    // Export to CSV
-    console.log(`Exporting to ${config.outputFile}...`);
-    await exportToCSV(processedUsers, config.outputFile);
+    const totalUsers = await getAllUsers(
+      cognito,
+      config.userPoolId,
+      config.outputFile
+    );
+    console.log(`Successfully processed ${totalUsers} users`);
 
     // Verify file was created
     if (fs.existsSync(config.outputFile)) {
