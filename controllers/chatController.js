@@ -133,13 +133,25 @@ function createChatRetriever({ index_chat_messages, conversationId }) {
 }
 
 class CombinedRetriever {
-  constructor(retrievers) {
+  constructor(retrievers, retrieverTypes) {
     this.retrievers = retrievers;
+    this.retrieverTypes = retrieverTypes; // Array of types matching retrievers array
   }
 
   async retrieve(query) {
     const results = await Promise.all(
-      this.retrievers.map((retriever) => retriever.retrieve(query))
+      this.retrievers.map((retriever, index) =>
+        retriever.retrieve(query).then((nodes) =>
+          nodes.map((node) => {
+            // Add source metadata to each node
+            if (!node.metadata) {
+              node.metadata = {};
+            }
+            node.metadata.source_type = this.retrieverTypes[index];
+            return node;
+          })
+        )
+      )
     );
     return results.flat();
   }
@@ -213,6 +225,7 @@ export async function handleLLMStream(req, res) {
       await createIndices();
 
     let retrievers = [];
+    let retrieverTypes = [];
     let response;
 
     // Add chat retriever if we have a conversation ID
@@ -222,6 +235,7 @@ export async function handleLLMStream(req, res) {
         conversationId,
       });
       retrievers.push(retriever_chat);
+      retrieverTypes.push("chat");
     }
 
     // Add assistant retriever if we have an assistant ID
@@ -231,10 +245,11 @@ export async function handleLLMStream(req, res) {
         assistantId,
       });
       retrievers.push(retriever_assistant);
+      retrieverTypes.push("assistant");
     }
 
     // Create combined retriever
-    const combinedRetriever = new CombinedRetriever(retrievers);
+    const combinedRetriever = new CombinedRetriever(retrievers, retrieverTypes);
 
     // Get results from all retrievers
     const results = await combinedRetriever.retrieve(query);
@@ -280,30 +295,68 @@ export async function handleLLMStream(req, res) {
     } else {
       console.log("Using retriever response");
 
-      const responseSynthesizer = await getResponseSynthesizer(
-        "tree_summarize",
-        {
-          llm: new OpenAI({
-            azure: {
-              endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-              deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-              apiKey: process.env.AZURE_OPENAI_KEY,
-            },
-            model: process.env.MODEL,
-            additionalChatOptions: {
-              frequency_penalty: assistantConfig.frequencyPenalty,
-              presence_penalty: assistantConfig.presencePenalty,
-              stream: true,
-            },
-            temperature: assistantConfig.temperature,
-            topP: assistantConfig.topP,
-          }),
-        }
-      );
+      const responseSynthesizer = await getResponseSynthesizer("refine", {
+        llm: new OpenAI({
+          azure: {
+            endpoint: process.env.AZURE_OPENAI_ENDPOINT,
+            deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+            apiKey: process.env.AZURE_OPENAI_KEY,
+          },
+          model: process.env.MODEL,
+          additionalChatOptions: {
+            frequency_penalty: assistantConfig.frequencyPenalty,
+            presence_penalty: assistantConfig.presencePenalty,
+            stream: true,
+          },
+          temperature: assistantConfig.temperature,
+          topP: assistantConfig.topP,
+        }),
+        textQATemplate: `
+            Context information is provided below. This information comes from two sources:
+            1. Conversation history - which contains previous messages from the chat
+            2. Knowledge base - which contains reference documents and information
+            
+            The sources are marked in the context.
+            
+            Given this information, please answer the query.
+            
+            Context:
+            {context_str}
+            
+            Query: {query_str}
+            
+            Answer:
+          `,
+      });
+
+      // Define a transformer function to preprocess retrieved nodes
+      const transformNodes = (nodes) => {
+        return nodes.map((node) => {
+          // Add source type prefix to each node's text
+          const sourceType = node.metadata?.source_type || "unknown";
+          let prefix = "";
+
+          if (sourceType === "chat") {
+            prefix = "[FROM CONVERSATION HISTORY]: ";
+          } else if (sourceType === "assistant") {
+            prefix = "[FROM KNOWLEDGE BASE]: ";
+          }
+
+          // Create a copy of the node with modified text
+          return {
+            ...node,
+            text: prefix + node.text,
+          };
+        });
+      };
 
       const queryEngine = new RetrieverQueryEngine(
         combinedRetriever,
-        responseSynthesizer
+        responseSynthesizer,
+        undefined,
+        {
+          nodeTransformer: transformNodes,
+        }
       );
 
       response = await queryEngine.query({
