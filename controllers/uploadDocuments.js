@@ -47,25 +47,76 @@ async function initializeSettings(config) {
   });
 }
 
-export function splitTextIntoChunks(text, chunkSize = 256) {
+export function splitTextIntoChunks(text, chunkSize = 512, overlap = 128) {
+  if (overlap >= chunkSize) {
+    throw new Error('Overlap size must be less than chunk size');
+  }
+
+  // Normalize spaces and clean the text first
+  const normalizedText = text.replace(/\s+/g, ' ').trim();
+
+  // Split into sentences, being careful with Turkish punctuation and sentence structure
+  const sentences = normalizedText
+    .split(/(?<=[.!?])\s*(?=[A-ZĞÜŞİÖÇa-zğüşıöç])/u)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
   const chunks = [];
-  let currentChunk = "";
+  let currentChunk = [];
+  let currentLength = 0;
+  let lastChunkEndIndex = 0;
 
-  const sentences = text.match(/[^\.!\?]+[\.!\?]+/g) || [text];
+  for (let i = 0; i < sentences.length; i++) {
+    const sentence = sentences[i];
 
-  for (const sentence of sentences) {
-    if ((currentChunk + sentence).length > chunkSize) {
-      if (currentChunk) chunks.push(currentChunk.trim());
-      currentChunk = "";
+    // Add sentence to current chunk if it fits
+    if (currentLength + sentence.length <= chunkSize) {
+      currentChunk.push(sentence);
+      currentLength += sentence.length + 1; // +1 for space
+    } else {
+      // Store current chunk
+      if (currentChunk.length > 0) {
+        chunks.push(currentChunk.join(' '));
+
+        // Calculate overlap
+        let overlapLength = 0;
+        let overlapSentences = [];
+
+        // Go backwards through current chunk to build overlap
+        for (let j = currentChunk.length - 1; j >= 0; j--) {
+          const overlapSentence = currentChunk[j];
+          if (overlapLength + overlapSentence.length <= overlap) {
+            overlapSentences.unshift(overlapSentence);
+            overlapLength += overlapSentence.length + 1;
+          } else {
+            break;
+          }
+        }
+
+        // Start new chunk with overlap sentences
+        currentChunk = [...overlapSentences];
+        currentLength = overlapSentences.join(' ').length;
+      }
+
+      // Add current sentence to new chunk if it fits
+      if (sentence.length <= chunkSize) {
+        currentChunk.push(sentence);
+        currentLength += sentence.length + 1;
+      } else {
+        // Handle very long sentences by splitting them
+        console.warn('Found very long sentence that exceeds chunk size');
+        currentChunk.push(sentence);
+        currentLength += sentence.length + 1;
+      }
     }
-    currentChunk += sentence + " ";
   }
 
-  if (currentChunk) {
-    chunks.push(currentChunk.trim());
+  // Add final chunk if there's anything left
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk.join(' '));
   }
 
-  return chunks;
+  return chunks.map(chunk => chunk.trim());
 }
 
 /**
@@ -160,8 +211,8 @@ export async function handleAddDocumentsToAssistantDocuments(req, res) {
     // Initialize settings before proceeding
     await initializeSettings(assistantConfig);
 
-    // Split text into smaller chunks
-    const chunks = splitTextIntoChunks(text);
+    // Split text into smaller chunks with overlap
+    const chunks = splitTextIntoChunks(text, 512, 102); // Increased overlap for better context
 
     // Create documents with metadata
     const documents = createDocumentsFromChunks(chunks, {
@@ -170,7 +221,6 @@ export async function handleAddDocumentsToAssistantDocuments(req, res) {
     });
 
     console.log(documents);
-
     // Store documents in Pinecone Vector Store
     await storeAssistantDocuments(documents);
 
