@@ -4,15 +4,17 @@ import {
   VectorStoreIndex,
   Settings,
   OpenAIEmbedding,
-  ContextChatEngine,
-  SummaryIndex,
-  OpenAIContextAwareAgent,
   getResponseSynthesizer,
   RetrieverQueryEngine,
   VectorIndexRetriever,
+  defaultRefinePrompt
 } from "llamaindex";
-import { GetCommand } from "@aws-sdk/lib-dynamodb";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  GetCommand
+} from "@aws-sdk/lib-dynamodb";
+import {
+  DynamoDBClient
+} from "@aws-sdk/client-dynamodb";
 const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
 });
@@ -47,7 +49,9 @@ function getAzureEmbeddingOptions() {
 
 // Initialize OpenAI settings based on assistant configuration
 async function initializeSettings(config) {
-  const { setEnvs } = await import("@llamaindex/env");
+  const {
+    setEnvs
+  } = await import("@llamaindex/env");
   setEnvs(process.env);
   Settings.llm = new OpenAI({
     model: process.env.MODEL,
@@ -71,7 +75,7 @@ async function initializeSettings(config) {
 async function createIndices() {
   const pcvs_chat = new PineconeVectorStore({
     indexName: "chat-messages",
-    chunkSize: 100,
+    chunkSize: process.env.CHUNK_SIZE,
     storesText: true,
     embeddingModel: new OpenAIEmbedding({
       model: "text-embedding-3-small",
@@ -81,7 +85,7 @@ async function createIndices() {
 
   const pcvs_assistant = new PineconeVectorStore({
     indexName: "assistant-documents",
-    chunkSize: 100,
+    chunkSize: process.env.CHUNK_SIZE,
     storesText: true,
     embeddingModel: new OpenAIEmbedding({
       model: "text-embedding-3-small",
@@ -94,52 +98,66 @@ async function createIndices() {
     pcvs_assistant
   );
 
-  return { index_chat_messages, index_assistant_documents };
+  return {
+    index_chat_messages,
+    index_assistant_documents
+  };
 }
 
-function createAssistantRetriever({ index_assistant_documents, assistantId }) {
+function createAssistantRetriever({
+  index_assistant_documents,
+  assistantId
+}) {
   return new VectorIndexRetriever({
     index: index_assistant_documents,
     includeValues: true,
     filters: {
-      filters: [
-        {
-          key: "assistantId",
-          value: assistantId,
-          operator: "==",
-        },
-      ],
+      filters: [{
+        key: "assistantId",
+        value: assistantId,
+        operator: "==",
+      },],
     },
-    similarityTopK: 100,
+    similarityTopK: 5,
   });
 }
-function createChatRetriever({ index_chat_messages, conversationId }) {
+
+function createChatRetriever({
+  index_chat_messages,
+  conversationId
+}) {
   return new VectorIndexRetriever({
     index: index_chat_messages,
     includeValues: true,
     filters: {
-      filters: [
-        {
-          key: "conversationId",
-          value: conversationId,
-          operator: "==",
-        },
-      ],
+      filters: [{
+        key: "conversationId",
+        value: conversationId,
+        operator: "==",
+      },],
     },
-    similarityTopK: 100,
+    similarityTopK: 5,
   });
 }
 
+// Update the CombinedRetriever to properly merge results
 class CombinedRetriever {
   constructor(retrievers) {
     this.retrievers = retrievers;
   }
 
   async retrieve(query) {
+    // Get results from all retrievers
     const results = await Promise.all(
       this.retrievers.map((retriever) => retriever.retrieve(query))
     );
-    return results.flat();
+
+    // Flatten and sort by score
+    const flatResults = results.flat().sort((a, b) =>
+      (b.score || 0) - (a.score || 0)
+    );
+
+    return flatResults;
   }
 }
 
@@ -156,10 +174,23 @@ async function fetchAssistantConfig(assistantId, stage) {
   return result.Item ? result.Item : null;
 }
 
+// First, let's add a helper function to filter results by score
+function filterByScore(results, minScore = 0.40) {
+  return results.filter(result => (result.score || 0) > minScore);
+}
+
 // Controller to handle streaming reflection requests
 export async function handleWhatToAskController(req, res) {
-  const { userId, conversationId } = req.params;
-  const { query, assistantId, type, stage } = req.body;
+  const {
+    userId,
+    conversationId
+  } = req.params;
+  const {
+    query,
+    assistantId,
+    type,
+    stage
+  } = req.body;
 
   try {
     const systemMessage = await fetchAssistantConfig(assistantId, stage);
@@ -177,36 +208,76 @@ export async function handleWhatToAskController(req, res) {
     await initializeSettings(assistantConfig);
 
     // Create indices for both chat messages and assistant documents
-    const { index_chat_messages, index_assistant_documents } =
+    const {
+      index_chat_messages,
+      index_assistant_documents
+    } =
       await createIndices();
 
-    const retriever_chat = createChatRetriever({
-      index_chat_messages: index_chat_messages,
-      conversationId: conversationId,
-    });
-
+    // First, retrieve relevant assistant documents
     const retriever_assistant = createAssistantRetriever({
-      index_assistant_documents: index_assistant_documents,
-      assistantId: assistantId,
+      index_assistant_documents,
+      assistantId,
     });
 
-    // Combine the retrievers
-    const combinedRetriever =
-      conversationId == null
-        ? new CombinedRetriever([retriever_assistant])
-        : new CombinedRetriever([retriever_chat, retriever_assistant]);
+    let assistantDocs = await retriever_assistant.retrieve(query);
+    assistantDocs = filterByScore(assistantDocs);
 
-    // console.log(retriever_chat);
-    // console.log(retriever_chat.filters);
-    // console.log(retriever_chat.filters.filters);
+    // Then get relevant chat history for context
+    const retriever_chat = createChatRetriever({
+      index_chat_messages,
+      conversationId,
+    });
+    let chatHistory = await retriever_chat.retrieve(query);
+    chatHistory = filterByScore(chatHistory);
 
-    // console.log(retriever_assistant);
-    // console.log(retriever_assistant.filters);
-    // console.log(retriever_assistant.filters.filters);
+    // Format chat history into a conversation format
+    const formattedChatHistory = chatHistory
+      .sort((a, b) => (new Date(a.node.metadata?.createdAt).getTime() || 0) - (new Date(b.node.metadata?.createdAt).getTime() || 0))
+      .map(msg => `${msg.node.metadata?.role || 'Unknown'}: ${msg.node.text}`)
+      .join('\n');
+    // -----------------------------------
+    const formattedQuery = `
+            System Prompt:
+            ${replacedPatterns}
+            -----------------------------------
+            ${assistantDocs.length > 0 ? `Knowledge Base:\n${assistantDocs.map(doc => doc.node.text).join('\n')}\n-----------------------------------` : ''}
+            ${chatHistory.length > 0 ? `Conversation History:\n${formattedChatHistory}\n-----------------------------------` : ''}
+            Current User Query:
+            ${query}
+            -----------------------------------
+            ${getInstructions(assistantDocs.length > 0, chatHistory.length > 0)}
+            `;
 
-    console.log(await combinedRetriever.retrieve("networking"));
+    // Helper function to generate appropriate instructions based on available context
+    function getInstructions(hasKnowledge, hasHistory) {
+      if (hasKnowledge && hasHistory) {
+        return `Based on the Knowledge Base and Conversation History above:
+            1. First understand the user's intent from the Current User Query
+            2. Find relevant information from the Knowledge Base
+            3. Consider the context from the Conversation History
+            4. Provide a clear and contextual response`;
+      } else if (hasKnowledge) {
+        return `Based on the Knowledge Base above:
+            1. First understand the user's intent from the Current User Query
+            2. Find relevant information from the Knowledge Base
+            3. Provide a clear and informative response`;
+      } else if (hasHistory) {
+        return `Based on the Conversation History above:
+            1. First understand the user's intent from the Current User Query
+            2. Consider the context from the Conversation History
+            3. Provide a contextually appropriate response`;
+      } else {
+        return `Based on the System Prompt:
+            1. First understand the user's intent from the Current User Query
+            2. Provide a response aligned with the system context
+            3. If you cannot provide a specific answer, guide the user appropriately`;
+      }
+    }
 
-    const responseSynthesizer = await getResponseSynthesizer("tree_summarize", {
+    console.log('-----------------------------------');
+    console.log(formattedQuery);
+    const responseSynthesizer = await getResponseSynthesizer("compact", {
       llm: new OpenAI({
         azure: {
           endpoint: process.env.AZURE_OPENAI_ENDPOINT,
@@ -217,30 +288,48 @@ export async function handleWhatToAskController(req, res) {
         additionalChatOptions: {
           frequency_penalty: assistantConfig.frequencyPenalty,
           presence_penalty: assistantConfig.presencePenalty,
-          stream: assistantConfig.stream ? assistantConfig.stream : undefined,
+          stream: assistantConfig.stream,
         },
         temperature: assistantConfig.temperature,
         topP: assistantConfig.topP,
       }),
+      refineTemplate: defaultRefinePrompt.partialFormat({
+        query: query,
+        existingAnswer: formattedChatHistory,
+        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
+      }),
+      textQATemplate: defaultRefinePrompt.partialFormat({
+        chatHistory: formattedChatHistory,
+        existingAnswer: formattedChatHistory,
+        query: query,
+        question: query,
+        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
+      }),
     });
 
+    // Create query engine with just the assistant documents retriever
     const queryEngine = new RetrieverQueryEngine(
-      combinedRetriever,
+      retriever_assistant,
       responseSynthesizer
     );
-
-    const query_ = `[System Prompts: 
-            ${replacedPatterns}]
-            -----------------------------------
-            User Query:
-                ${query}
-            `;
-
-    console.log();
-    // Retrieve the result from queryEngine
+    queryEngine.updatePrompts({
+      textQATemplate: defaultRefinePrompt.partialFormat({
+        chatHistory: formattedChatHistory,
+        existingAnswer: formattedChatHistory,
+        query: query,
+        question: query,
+        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
+      }),
+      refineTemplate: defaultRefinePrompt.partialFormat({
+        query: query,
+        existingAnswer: formattedChatHistory,
+        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
+      }),
+    });
+    // Retrieve the result from queryEngine with the formatted query
     const result = await queryEngine.query({
       stream: true,
-      query: query_,
+      query: formattedQuery,
     });
 
     res.setHeader("Content-Type", "text/plain");
@@ -249,7 +338,6 @@ export async function handleWhatToAskController(req, res) {
     // Stream each chunk of the response
     if (result && typeof result[Symbol.asyncIterator] === "function") {
       for await (const chunk of result) {
-        console.log(chunk.response);
         res.write(chunk.response);
       }
       res.write("[DONE-UP]");
