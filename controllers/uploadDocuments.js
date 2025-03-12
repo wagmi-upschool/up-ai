@@ -8,7 +8,12 @@ import {
   storageContextFromDefaults,
   VectorStoreIndex,
   PineconeVectorStore,
+  PDFReader,
 } from "llamaindex";
+import fetch from "node-fetch";
+import { writeFile } from 'fs/promises';
+import path from 'path';
+import { v4 as uuidv4 } from 'uuid'; // You'll need to install this: npm install uuid
 
 dotenv.config(); // Load environment variables
 
@@ -162,21 +167,87 @@ export async function storeAssistantDocuments(documents) {
     throw new Error("No documents provided to store.");
   }
 
-  // Validate each document
-  documents.forEach((doc, idx) => {
+  console.log(`Processing ${documents.length} documents for storage...`);
+
+  // Validate each document and flatten metadata
+  documents = documents.map((doc, idx) => {
     if (!doc.text || typeof doc.text !== "string") {
       throw new Error(`Document at index ${idx} is missing valid text.`);
     }
+
+    // Flatten metadata if originalMetadata exists
+    if (doc.metadata?.originalMetadata) {
+      const { originalMetadata, ...otherMetadata } = doc.metadata;
+      doc.metadata = {
+        ...otherMetadata,
+        pdf_name: originalMetadata.file_name || '',
+        pdf_type: originalMetadata.file_type || '',
+        pdf_size: String(originalMetadata.file_size || ''),
+        pdf_page: String(originalMetadata.page_number || ''),
+      };
+    }
+
+    return doc;
   });
 
   try {
+    console.log('Creating VectorStoreIndex from documents...');
     // Create a VectorStoreIndex from the documents
     await VectorStoreIndex.fromDocuments(documents, {
       storageContext,
       embedModel: Settings.embedModel,
     });
+    console.log('Successfully stored documents in Pinecone');
   } catch (error) {
     console.error("Error in Pinecone add:", error);
+    throw error;
+  }
+}
+
+/**
+ * Fetches PDF from URL and extracts text content using LlamaIndex PDFReader
+ * @param {string} url - URL of the PDF file
+ * @returns {Promise<Document[]>} - Array of Document objects
+ */
+async function fetchAndExtractPDF(url) {
+  let tempFilePath = null;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch PDF: ${response.statusText}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Create temporary file
+    const tempFileName = `temp-${uuidv4()}.pdf`;
+    tempFilePath = path.join(process.cwd(), 'temp', tempFileName);
+
+    // Ensure temp directory exists
+    await fs.promises.mkdir(path.join(process.cwd(), 'temp'), { recursive: true });
+
+    // Write buffer to temporary file
+    await writeFile(tempFilePath, buffer);
+
+    // Use PDFReader with the file path
+    const reader = new PDFReader();
+    const documents = await reader.loadData(tempFilePath);
+
+    // Clean up: remove temporary file
+    await fs.promises.unlink(tempFilePath);
+
+    return documents;
+  } catch (error) {
+    // Clean up on error if temp file exists
+    if (tempFilePath) {
+      try {
+        await fs.promises.unlink(tempFilePath);
+      } catch (cleanupError) {
+        console.error('Error cleaning up temporary file:', cleanupError);
+      }
+    }
+    console.error("Error fetching or parsing PDF:", error);
     throw error;
   }
 }
@@ -185,20 +256,53 @@ export async function storeAssistantDocuments(documents) {
  * Controller function to add documents to assistant-documents
  */
 export async function handleAddDocumentsToAssistantDocuments(req, res) {
-  const {
-    assistantId
-  } = req.params; // Extract assistantId from URL
-  const {
-    text
-  } = req.body; // Extract text from request body
+  const { assistantId } = req.params;
+  const { text, url } = req.body;
 
-  if (!text) {
-    return res.status(400).json({
-      error: "No text provided"
-    });
-  }
+  console.log(`Processing request for assistantId: ${assistantId}`);
+  console.log(`Input type: ${url ? 'PDF URL' : 'text'}`);
 
   try {
+    let documents;
+
+    if (url) {
+      console.log(`Fetching PDF from URL: ${url}`);
+      // If URL is provided, fetch and extract documents from PDF
+      const pdfDocuments = await fetchAndExtractPDF(url);
+      console.log(`Successfully extracted ${pdfDocuments.length} pages from PDF`);
+
+      // Combine all PDF text and apply chunking
+      const combinedText = pdfDocuments.map(doc => doc.text).join(' ');
+      const chunks = splitTextIntoChunks(combinedText, 512, 102);
+      console.log(`Created ${chunks.length} chunks from PDF content`);
+
+      // Create new documents with chunks and metadata
+      documents = createDocumentsFromChunks(chunks, {
+        source: "assistant-documents",
+        assistantId: assistantId,
+        sourceType: "pdf",
+        sourceUrl: url,
+        // Store only essential PDF metadata as flat values
+        pdf_name: pdfDocuments[0]?.metadata?.file_name || '',
+        pdf_pages: String(pdfDocuments.length),
+        timestamp: new Date().toISOString(),
+      });
+    } else if (text) {
+      console.log('Processing text input');
+      // If direct text is provided, process it as before
+      const chunks = splitTextIntoChunks(text, 512, 102);
+      console.log(`Created ${chunks.length} chunks from text input`);
+
+      documents = createDocumentsFromChunks(chunks, {
+        source: "assistant-documents",
+        assistantId: assistantId,
+        sourceType: "text",
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      return res.status(400).json({ error: "Either text or PDF URL must be provided" });
+    }
+
     // Example OpenAI and Pinecone configuration
     const assistantConfig = {
       temperature: 0.2,
@@ -208,29 +312,25 @@ export async function handleAddDocumentsToAssistantDocuments(req, res) {
       stream: false,
     };
 
+    console.log('Initializing settings...');
     // Initialize settings before proceeding
     await initializeSettings(assistantConfig);
 
-    // Split text into smaller chunks with overlap
-    const chunks = splitTextIntoChunks(text, 512, 102); // Increased overlap for better context
-
-    // Create documents with metadata
-    const documents = createDocumentsFromChunks(chunks, {
-      source: "assistant-documents",
-      assistantId: assistantId,
-    });
-
-    console.log(documents);
+    console.log('Storing documents in Pinecone...');
     // Store documents in Pinecone Vector Store
     await storeAssistantDocuments(documents);
 
+    console.log('Successfully completed document processing');
     res.status(200).json({
-      message: "Documents added successfully"
+      message: "Documents added successfully",
+      documentCount: documents.length,
+      sourceType: url ? 'pdf' : 'text'
     });
   } catch (error) {
     console.error("Error adding documents:", error);
     res.status(500).json({
-      error: "Failed to add documents"
+      error: "Failed to add documents",
+      details: error.message
     });
   }
 }
