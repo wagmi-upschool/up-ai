@@ -140,6 +140,21 @@ const getRelatedChatMessages = async (conversationId) => {
       );
 
       if (data.Items && data.Items.length > 0) {
+        // Log the structure of the first message to see what fields are available
+        if (batchNumber === 1) {
+          console.log(
+            "Sample message structure:",
+            JSON.stringify(data.Items[0], null, 2)
+          );
+
+          // Check what roles are present in the messages
+          const roles = new Set();
+          data.Items.forEach((msg) => {
+            if (msg && msg.role) roles.add(msg.role);
+          });
+          console.log("Roles found in messages:", Array.from(roles));
+        }
+
         allMessages = [...allMessages, ...data.Items];
         console.log(
           `Retrieved ${data.Items.length} messages. Total for conversation ${conversationId}: ${allMessages.length}`
@@ -381,7 +396,7 @@ const convertToCSV = (data) => {
       "messageCount",
       "firstConversationDate",
       "lastConversationDate",
-      "userMessages",
+      "allMessages",
     ];
     const csvRows = [headers.join(",")];
 
@@ -411,13 +426,27 @@ const convertToCSV = (data) => {
             ).toISOString()
           : "";
 
-        // Extract and concatenate all user messages
-        const userMessages = item.conversations
-          .flatMap((conv) =>
-            (conv.relatedChatMessages || [])
-              .filter((msg) => msg && msg.role === "human")
-              .map((msg) => msg.content || "")
-          )
+        // Extract and concatenate all messages - both user and assistant
+        const allMessages = item.conversations
+          .flatMap((conv) => {
+            const messages = conv.relatedChatMessages || [];
+
+            // Log message count to understand what we have
+            if (messages.length > 0 && !item._logged) {
+              const roles = messages.map((m) => m.role).filter(Boolean);
+              console.log(
+                `Conversation ${conv.conversationId} has ${
+                  messages.length
+                } messages with roles: ${roles.join(", ") || "none"}`
+              );
+              item._logged = true; // Prevent excessive logging
+            }
+
+            // Include ALL messages, prefixed by their role for clarity
+            return messages
+              .filter((msg) => msg && msg.content)
+              .map((msg) => `[${msg.role || "unknown"}]: ${msg.content || ""}`);
+          })
           .join(" | "); // Separate messages with pipe character
 
         // Ensure all values are strings before using replace
@@ -430,7 +459,7 @@ const convertToCSV = (data) => {
           messageCount.toString(),
           firstDate || "",
           lastDate || "",
-          userMessages || "",
+          allMessages || "", // Using all messages instead of just user messages
         ].map((value) => {
           // Ensure value is a string before using replace
           const stringValue = String(value);
