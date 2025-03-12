@@ -6,6 +6,7 @@ import {
   OpenAIEmbedding,
   getResponseSynthesizer,
   RetrieverQueryEngine,
+  defaultTreeSummarizePrompt,
   VectorIndexRetriever,
   defaultRefinePrompt
 } from "llamaindex";
@@ -175,7 +176,7 @@ async function fetchAssistantConfig(assistantId, stage) {
 }
 
 // First, let's add a helper function to filter results by score
-function filterByScore(results, minScore = 0.40) {
+function filterByScore(results, minScore = 0.25) {
   return results.filter(result => (result.score || 0) > minScore);
 }
 
@@ -221,6 +222,7 @@ export async function handleWhatToAskController(req, res) {
     });
 
     let assistantDocs = await retriever_assistant.retrieve(query);
+    console.log('assistantDocs', assistantDocs);
     assistantDocs = filterByScore(assistantDocs);
 
     // Then get relevant chat history for context
@@ -238,8 +240,7 @@ export async function handleWhatToAskController(req, res) {
       .join('\n');
     // -----------------------------------
     const formattedQuery = `
-            System Prompt:
-            ${replacedPatterns}
+     
             -----------------------------------
             ${assistantDocs.length > 0 ? `Knowledge Base:\n${assistantDocs.map(doc => doc.node.text).join('\n')}\n-----------------------------------` : ''}
             ${chatHistory.length > 0 ? `Conversation History:\n${formattedChatHistory}\n-----------------------------------` : ''}
@@ -277,6 +278,7 @@ export async function handleWhatToAskController(req, res) {
 
     console.log('-----------------------------------');
     console.log(formattedQuery);
+    return;
     const responseSynthesizer = await getResponseSynthesizer("compact", {
       llm: new OpenAI({
         azure: {
@@ -298,7 +300,7 @@ export async function handleWhatToAskController(req, res) {
         existingAnswer: formattedChatHistory,
         context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
       }),
-      textQATemplate: defaultRefinePrompt.partialFormat({
+      textQATemplate: defaultTreeSummarizePrompt.partialFormat({
         chatHistory: formattedChatHistory,
         existingAnswer: formattedChatHistory,
         query: query,
@@ -313,7 +315,7 @@ export async function handleWhatToAskController(req, res) {
       responseSynthesizer
     );
     queryEngine.updatePrompts({
-      textQATemplate: defaultRefinePrompt.partialFormat({
+      textQATemplate: defaultTreeSummarizePrompt.partialFormat({
         chatHistory: formattedChatHistory,
         existingAnswer: formattedChatHistory,
         query: query,
