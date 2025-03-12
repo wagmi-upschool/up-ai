@@ -23,7 +23,9 @@ function getAzureEmbeddingOptions() {
 
 // Initialize OpenAI and Pinecone settings
 async function initializeSettings(config) {
-  const { setEnvs } = await import("@llamaindex/env");
+  const {
+    setEnvs
+  } = await import("@llamaindex/env");
   setEnvs(process.env); // Set environment variables for LlamaIndex
 
   Settings.llm = new OpenAI({
@@ -45,7 +47,7 @@ async function initializeSettings(config) {
   });
 }
 
-export function splitTextIntoChunks(text, chunkSize = 1000) {
+export function splitTextIntoChunks(text, chunkSize = 256) {
   const chunks = [];
   let currentChunk = "";
 
@@ -132,11 +134,17 @@ export async function storeAssistantDocuments(documents) {
  * Controller function to add documents to assistant-documents
  */
 export async function handleAddDocumentsToAssistantDocuments(req, res) {
-  const { assistantId } = req.params; // Extract assistantId from URL
-  const { text } = req.body; // Extract text from request body
+  const {
+    assistantId
+  } = req.params; // Extract assistantId from URL
+  const {
+    text
+  } = req.body; // Extract text from request body
 
   if (!text) {
-    return res.status(400).json({ error: "No text provided" });
+    return res.status(400).json({
+      error: "No text provided"
+    });
   }
 
   try {
@@ -166,9 +174,13 @@ export async function handleAddDocumentsToAssistantDocuments(req, res) {
     // Store documents in Pinecone Vector Store
     await storeAssistantDocuments(documents);
 
-    res.status(200).json({ message: "Documents added successfully" });
+    res.status(200).json({
+      message: "Documents added successfully"
+    });
   } catch (error) {
     console.error("Error adding documents:", error);
-    res.status(500).json({ error: "Failed to add documents" });
+    res.status(500).json({
+      error: "Failed to add documents"
+    });
   }
 }

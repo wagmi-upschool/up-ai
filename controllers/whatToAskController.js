@@ -4,15 +4,17 @@ import {
   VectorStoreIndex,
   Settings,
   OpenAIEmbedding,
-  ContextChatEngine,
-  SummaryIndex,
-  OpenAIContextAwareAgent,
   getResponseSynthesizer,
   RetrieverQueryEngine,
   VectorIndexRetriever,
+  defaultContextSystemPrompt,
 } from "llamaindex";
-import { GetCommand } from "@aws-sdk/lib-dynamodb";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  GetCommand
+} from "@aws-sdk/lib-dynamodb";
+import {
+  DynamoDBClient
+} from "@aws-sdk/client-dynamodb";
 const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
 });
@@ -47,7 +49,9 @@ function getAzureEmbeddingOptions() {
 
 // Initialize OpenAI settings based on assistant configuration
 async function initializeSettings(config) {
-  const { setEnvs } = await import("@llamaindex/env");
+  const {
+    setEnvs
+  } = await import("@llamaindex/env");
   setEnvs(process.env);
   Settings.llm = new OpenAI({
     model: process.env.MODEL,
@@ -94,52 +98,66 @@ async function createIndices() {
     pcvs_assistant
   );
 
-  return { index_chat_messages, index_assistant_documents };
+  return {
+    index_chat_messages,
+    index_assistant_documents
+  };
 }
 
-function createAssistantRetriever({ index_assistant_documents, assistantId }) {
+function createAssistantRetriever({
+  index_assistant_documents,
+  assistantId
+}) {
   return new VectorIndexRetriever({
     index: index_assistant_documents,
     includeValues: true,
     filters: {
-      filters: [
-        {
-          key: "assistantId",
-          value: assistantId,
-          operator: "==",
-        },
-      ],
-    },
-    similarityTopK: 100,
-  });
-}
-function createChatRetriever({ index_chat_messages, conversationId }) {
-  return new VectorIndexRetriever({
-    index: index_chat_messages,
-    includeValues: true,
-    filters: {
-      filters: [
-        {
-          key: "conversationId",
-          value: conversationId,
-          operator: "==",
-        },
-      ],
+      filters: [{
+        key: "assistantId",
+        value: assistantId,
+        operator: "==",
+      },],
     },
     similarityTopK: 100,
   });
 }
 
+function createChatRetriever({
+  index_chat_messages,
+  conversationId
+}) {
+  return new VectorIndexRetriever({
+    index: index_chat_messages,
+    includeValues: true,
+    filters: {
+      filters: [{
+        key: "conversationId",
+        value: conversationId,
+        operator: "==",
+      },],
+    },
+    similarityTopK: 100,
+  });
+}
+
+// Update the CombinedRetriever to properly merge results
 class CombinedRetriever {
   constructor(retrievers) {
     this.retrievers = retrievers;
   }
 
   async retrieve(query) {
+    // Get results from all retrievers
     const results = await Promise.all(
       this.retrievers.map((retriever) => retriever.retrieve(query))
     );
-    return results.flat();
+
+    // Flatten and sort by score
+    const flatResults = results.flat().sort((a, b) =>
+      (b.score || 0) - (a.score || 0)
+    );
+
+    return flatResults;
   }
 }
 
@@ -158,8 +176,16 @@ async function fetchAssistantConfig(assistantId, stage) {
 
 // Controller to handle streaming reflection requests
 export async function handleWhatToAskController(req, res) {
-  const { userId, conversationId } = req.params;
-  const { query, assistantId, type, stage } = req.body;
+  const {
+    userId,
+    conversationId
+  } = req.params;
+  const {
+    query,
+    assistantId,
+    type,
+    stage
+  } = req.body;
 
   try {
     const systemMessage = await fetchAssistantConfig(assistantId, stage);
@@ -177,36 +203,52 @@ export async function handleWhatToAskController(req, res) {
     await initializeSettings(assistantConfig);
 
     // Create indices for both chat messages and assistant documents
-    const { index_chat_messages, index_assistant_documents } =
+    const {
+      index_chat_messages,
+      index_assistant_documents
+    } =
       await createIndices();
 
-    const retriever_chat = createChatRetriever({
-      index_chat_messages: index_chat_messages,
-      conversationId: conversationId,
-    });
-
+    // First, retrieve relevant assistant documents
     const retriever_assistant = createAssistantRetriever({
-      index_assistant_documents: index_assistant_documents,
-      assistantId: assistantId,
+      index_assistant_documents,
+      assistantId,
     });
 
-    // Combine the retrievers
-    const combinedRetriever =
-      conversationId == null
-        ? new CombinedRetriever([retriever_assistant])
-        : new CombinedRetriever([retriever_chat, retriever_assistant]);
+    const assistantDocs = await retriever_assistant.retrieve(query);
 
-    // console.log(retriever_chat);
-    // console.log(retriever_chat.filters);
-    // console.log(retriever_chat.filters.filters);
+    // Then get relevant chat history for context
+    const retriever_chat = createChatRetriever({
+      index_chat_messages,
+      conversationId,
+    });
 
-    // console.log(retriever_assistant);
-    // console.log(retriever_assistant.filters);
-    // console.log(retriever_assistant.filters.filters);
+    const chatHistory = await retriever_chat.retrieve(query);
 
-    console.log(await combinedRetriever.retrieve("networking"));
+    // Format chat history into a conversation format
+    const formattedChatHistory = chatHistory
+      .sort((a, b) => (a.metadata?.timestamp || 0) - (b.metadata?.timestamp || 0))
+      .map(msg => `${msg.metadata?.role || 'Unknown'}: ${msg.text}`)
+      .join('\n');
 
-    const responseSynthesizer = await getResponseSynthesizer("tree_summarize", {
+    // Format the query with assistant docs as knowledge and chat history as memory
+    const formattedQuery = `[System Prompts: 
+            ${replacedPatterns}]
+            -----------------------------------
+            Knowledge Base:
+            ${assistantDocs.map(doc => doc.text).join('\n')}
+            -----------------------------------
+            Conversation History:
+            ${formattedChatHistory}
+            -----------------------------------
+            Current User Query:
+                ${query}
+            
+            Please provide a response using the knowledge from the Knowledge Base while 
+            considering the context from the Conversation History.
+            `;
+
+    const responseSynthesizer = await getResponseSynthesizer("compact", {
       llm: new OpenAI({
         azure: {
           endpoint: process.env.AZURE_OPENAI_ENDPOINT,
@@ -217,30 +259,24 @@ export async function handleWhatToAskController(req, res) {
         additionalChatOptions: {
           frequency_penalty: assistantConfig.frequencyPenalty,
           presence_penalty: assistantConfig.presencePenalty,
-          stream: assistantConfig.stream ? assistantConfig.stream : undefined,
+          stream: assistantConfig.stream,
         },
         temperature: assistantConfig.temperature,
         topP: assistantConfig.topP,
       }),
+      textQATemplate: defaultContextSystemPrompt,
     });
 
+    // Create query engine with just the assistant documents retriever
     const queryEngine = new RetrieverQueryEngine(
-      combinedRetriever,
+      retriever_assistant,
       responseSynthesizer
     );
 
-    const query_ = `[System Prompts: 
-            ${replacedPatterns}]
-            -----------------------------------
-            User Query:
-                ${query}
-            `;
-
-    console.log();
     // Retrieve the result from queryEngine
     const result = await queryEngine.query({
       stream: true,
-      query: query_,
+      query: formattedQuery,
     });
 
     res.setHeader("Content-Type", "text/plain");
