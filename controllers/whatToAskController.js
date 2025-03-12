@@ -7,7 +7,7 @@ import {
   getResponseSynthesizer,
   RetrieverQueryEngine,
   VectorIndexRetriever,
-  defaultContextSystemPrompt,
+  defaultRefinePrompt
 } from "llamaindex";
 import {
   GetCommand
@@ -75,7 +75,7 @@ async function initializeSettings(config) {
 async function createIndices() {
   const pcvs_chat = new PineconeVectorStore({
     indexName: "chat-messages",
-    chunkSize: 100,
+    chunkSize: process.env.CHUNK_SIZE,
     storesText: true,
     embeddingModel: new OpenAIEmbedding({
       model: "text-embedding-3-small",
@@ -85,7 +85,7 @@ async function createIndices() {
 
   const pcvs_assistant = new PineconeVectorStore({
     indexName: "assistant-documents",
-    chunkSize: 100,
+    chunkSize: process.env.CHUNK_SIZE,
     storesText: true,
     embeddingModel: new OpenAIEmbedding({
       model: "text-embedding-3-small",
@@ -118,7 +118,7 @@ function createAssistantRetriever({
         operator: "==",
       },],
     },
-    similarityTopK: 100,
+    similarityTopK: 5,
   });
 }
 
@@ -136,7 +136,7 @@ function createChatRetriever({
         operator: "==",
       },],
     },
-    similarityTopK: 100,
+    similarityTopK: 5,
   });
 }
 
@@ -172,6 +172,11 @@ async function fetchAssistantConfig(assistantId, stage) {
   };
   const result = await dynamoDbClient.send(new GetCommand(params));
   return result.Item ? result.Item : null;
+}
+
+// First, let's add a helper function to filter results by score
+function filterByScore(results, minScore = 0.40) {
+  return results.filter(result => (result.score || 0) > minScore);
 }
 
 // Controller to handle streaming reflection requests
@@ -215,39 +220,63 @@ export async function handleWhatToAskController(req, res) {
       assistantId,
     });
 
-    const assistantDocs = await retriever_assistant.retrieve(query);
+    let assistantDocs = await retriever_assistant.retrieve(query);
+    assistantDocs = filterByScore(assistantDocs);
 
     // Then get relevant chat history for context
     const retriever_chat = createChatRetriever({
       index_chat_messages,
       conversationId,
     });
-
-    const chatHistory = await retriever_chat.retrieve(query);
+    let chatHistory = await retriever_chat.retrieve(query);
+    chatHistory = filterByScore(chatHistory);
 
     // Format chat history into a conversation format
     const formattedChatHistory = chatHistory
-      .sort((a, b) => (a.metadata?.timestamp || 0) - (b.metadata?.timestamp || 0))
-      .map(msg => `${msg.metadata?.role || 'Unknown'}: ${msg.text}`)
+      .sort((a, b) => (new Date(a.node.metadata?.createdAt).getTime() || 0) - (new Date(b.node.metadata?.createdAt).getTime() || 0))
+      .map(msg => `${msg.node.metadata?.role || 'Unknown'}: ${msg.node.text}`)
       .join('\n');
-
-    // Format the query with assistant docs as knowledge and chat history as memory
-    const formattedQuery = `[System Prompts: 
-            ${replacedPatterns}]
+    // -----------------------------------
+    const formattedQuery = `
+            System Prompt:
+            ${replacedPatterns}
             -----------------------------------
-            Knowledge Base:
-            ${assistantDocs.map(doc => doc.text).join('\n')}
-            -----------------------------------
-            Conversation History:
-            ${formattedChatHistory}
-            -----------------------------------
+            ${assistantDocs.length > 0 ? `Knowledge Base:\n${assistantDocs.map(doc => doc.node.text).join('\n')}\n-----------------------------------` : ''}
+            ${chatHistory.length > 0 ? `Conversation History:\n${formattedChatHistory}\n-----------------------------------` : ''}
             Current User Query:
-                ${query}
-            
-            Please provide a response using the knowledge from the Knowledge Base while 
-            considering the context from the Conversation History.
+            ${query}
+            -----------------------------------
+            ${getInstructions(assistantDocs.length > 0, chatHistory.length > 0)}
             `;
 
+    // Helper function to generate appropriate instructions based on available context
+    function getInstructions(hasKnowledge, hasHistory) {
+      if (hasKnowledge && hasHistory) {
+        return `Based on the Knowledge Base and Conversation History above:
+            1. First understand the user's intent from the Current User Query
+            2. Find relevant information from the Knowledge Base
+            3. Consider the context from the Conversation History
+            4. Provide a clear and contextual response`;
+      } else if (hasKnowledge) {
+        return `Based on the Knowledge Base above:
+            1. First understand the user's intent from the Current User Query
+            2. Find relevant information from the Knowledge Base
+            3. Provide a clear and informative response`;
+      } else if (hasHistory) {
+        return `Based on the Conversation History above:
+            1. First understand the user's intent from the Current User Query
+            2. Consider the context from the Conversation History
+            3. Provide a contextually appropriate response`;
+      } else {
+        return `Based on the System Prompt:
+            1. First understand the user's intent from the Current User Query
+            2. Provide a response aligned with the system context
+            3. If you cannot provide a specific answer, guide the user appropriately`;
+      }
+    }
+
+    console.log('-----------------------------------');
+    console.log(formattedQuery);
     const responseSynthesizer = await getResponseSynthesizer("compact", {
       llm: new OpenAI({
         azure: {
@@ -264,7 +293,18 @@ export async function handleWhatToAskController(req, res) {
         temperature: assistantConfig.temperature,
         topP: assistantConfig.topP,
       }),
-      textQATemplate: defaultContextSystemPrompt,
+      refineTemplate: defaultRefinePrompt.partialFormat({
+        query: query,
+        existingAnswer: formattedChatHistory,
+        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
+      }),
+      textQATemplate: defaultRefinePrompt.partialFormat({
+        chatHistory: formattedChatHistory,
+        existingAnswer: formattedChatHistory,
+        query: query,
+        question: query,
+        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
+      }),
     });
 
     // Create query engine with just the assistant documents retriever
@@ -272,8 +312,21 @@ export async function handleWhatToAskController(req, res) {
       retriever_assistant,
       responseSynthesizer
     );
-
-    // Retrieve the result from queryEngine
+    queryEngine.updatePrompts({
+      textQATemplate: defaultRefinePrompt.partialFormat({
+        chatHistory: formattedChatHistory,
+        existingAnswer: formattedChatHistory,
+        query: query,
+        question: query,
+        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
+      }),
+      refineTemplate: defaultRefinePrompt.partialFormat({
+        query: query,
+        existingAnswer: formattedChatHistory,
+        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
+      }),
+    });
+    // Retrieve the result from queryEngine with the formatted query
     const result = await queryEngine.query({
       stream: true,
       query: formattedQuery,
@@ -285,7 +338,6 @@ export async function handleWhatToAskController(req, res) {
     // Stream each chunk of the response
     if (result && typeof result[Symbol.asyncIterator] === "function") {
       for await (const chunk of result) {
-        console.log(chunk.response);
         res.write(chunk.response);
       }
       res.write("[DONE-UP]");
