@@ -1,0 +1,33 @@
+FROM node:18-alpine
+
+# Install bash for scripts
+RUN apk add --no-cache bash
+
+# Create a non-root user and set working directory
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S -u 1001 -G nodejs nodejs && \
+    mkdir -p /home/nodejs/app && \
+    chown -R nodejs:nodejs /home/nodejs
+
+WORKDIR /home/nodejs/app
+
+# Copy package files
+COPY --chown=nodejs:nodejs package*.json ./
+
+# Install dependencies with stringent space constraints
+RUN npm config set cache /tmp/npm-cache && \
+    npm install --only=production --no-optional --no-package-lock --no-fund && \
+    npm cache clean --force && \
+    rm -rf /tmp/* /var/cache/apk/*
+
+# Copy application code
+COPY --chown=nodejs:nodejs . .
+
+# Switch to non-root user
+USER nodejs
+
+# Expose port
+EXPOSE 3000
+
+# Run the app
+CMD ["node", "app.js"] 
