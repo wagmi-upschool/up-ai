@@ -1,0 +1,58 @@
+# Build stage with network retry configurations
+FROM node:18-alpine AS builder
+
+# Set npm configurations for better network reliability
+RUN npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-timeout 600000 && \
+    npm config set fetch-retries 5 && \
+    npm config set registry https://registry.npmjs.org/
+
+# Create app directory
+WORKDIR /usr/src/app
+
+# First just copy package files to leverage Docker caching
+COPY package*.json ./
+
+# Install dependencies with retry mechanism
+RUN apk add --no-cache --virtual .build-deps python3 make g++ && \
+    echo "Attempting npm install..." && \
+    (npm install --only=production --no-fund || \
+     (echo "First attempt failed, retrying..." && \
+      npm cache clean --force && \
+      npm install --only=production --no-fund --prefer-offline || \
+      (echo "Second attempt failed, retrying with network settings..." && \
+       npm cache clean --force && \
+       npm install --only=production --no-fund --network-timeout 100000))) && \
+    npm cache clean --force && \
+    apk del .build-deps && \
+    rm -rf /tmp/* /var/cache/apk/*
+
+# Copy app source
+COPY . .
+
+# Production stage
+FROM node:18-alpine
+
+# Create app directory
+WORKDIR /usr/src/app
+
+# Copy only node_modules and app files from builder
+COPY --from=builder /usr/src/app/node_modules ./node_modules
+COPY --from=builder /usr/src/app/. .
+
+# Run as non-root user for better security
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S -u 1001 -G nodejs nodejs && \
+    chown -R nodejs:nodejs /usr/src/app
+
+USER nodejs
+
+# Set environment variable
+ENV NODE_ENV production
+
+# Expose port
+EXPOSE 3000
+
+# Run app
+CMD ["node", "app.js"] 

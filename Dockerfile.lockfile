@@ -1,0 +1,65 @@
+# Build stage for dependencies
+FROM node:18-alpine AS dependencies
+
+# Set npm configurations for better network reliability
+RUN npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-timeout 600000 && \
+    npm config set fetch-retries 5
+
+# Set working directory
+WORKDIR /usr/src/app
+
+# Copy package files
+COPY package*.json ./
+
+# Generate package-lock.json if it doesn't exist
+RUN test -f package-lock.json || npm install --package-lock-only
+
+# Install build dependencies and set up retry logic
+RUN apk add --no-cache --virtual .build-deps python3 make g++ && \
+    echo "Attempting npm ci..." && \
+    (npm ci --only=production --no-fund || \
+     (echo "npm ci failed, falling back to npm install..." && \
+      npm cache clean --force && \
+      npm install --only=production --no-fund --prefer-offline)) && \
+    npm cache clean --force && \
+    apk del .build-deps && \
+    rm -rf /tmp/* /var/cache/apk/*
+
+# Build stage for application
+FROM node:18-alpine AS builder
+
+# Set working directory
+WORKDIR /usr/src/app
+
+# Copy dependencies from previous stage
+COPY --from=dependencies /usr/src/app/node_modules ./node_modules
+COPY . .
+
+# Production stage
+FROM node:18-alpine
+
+# Create app directory
+WORKDIR /usr/src/app
+
+# Create and use non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S -u 1001 -G nodejs nodejs && \
+    chown -R nodejs:nodejs /usr/src/app
+
+# Copy app from builder stage
+COPY --from=builder --chown=nodejs:nodejs /usr/src/app/node_modules ./node_modules
+COPY --from=builder --chown=nodejs:nodejs /usr/src/app/. .
+
+# Use non-root user
+USER nodejs
+
+# Set environment to production
+ENV NODE_ENV production
+
+# Expose port
+EXPOSE 3000
+
+# Start app
+CMD ["node", "app.js"] 
