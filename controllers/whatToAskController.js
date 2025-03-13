@@ -278,7 +278,6 @@ export async function handleWhatToAskController(req, res) {
 
     console.log('-----------------------------------');
     console.log(formattedQuery);
-    return;
     const responseSynthesizer = await getResponseSynthesizer("compact", {
       llm: new OpenAI({
         azure: {
