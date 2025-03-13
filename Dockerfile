@@ -4,6 +4,9 @@ FROM node:18-alpine AS builder
 # Set the working directory
 WORKDIR /usr/src/app
 
+# Install Python and build dependencies needed for node-gyp
+RUN apk add --no-cache python3 make g++ gcc
+
 # Copy package.json and package-lock.json
 COPY package*.json ./
 
