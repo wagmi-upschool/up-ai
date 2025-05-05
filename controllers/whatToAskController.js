@@ -237,22 +237,16 @@ function getStage2Prompt(
       content: msg.text || "",
     }))
     .filter((msg) => msg.content); // Ensure content is not empty
-  console.log(
-    "formattedHistoryMessages inside getStage2Prompt:",
-    formattedHistoryMessages
-  );
 
-  // Construct the message array for the LLM using function parameters
-  const messages = [
-    { role: "system", content: `${agentPrompt}\n\n${stage2Instructions}` }, // Combined system prompt
-    ...formattedHistoryMessages, // Spread the history messages (user/assistant)
-    { role: "assistant", content: stage1Response }, // Use passed stage1Response
-    { role: "user", content: query }, // Use passed query
-  ];
-
-  console.log("messages inside getStage2Prompt:", messages);
-
-  return messages; // Return the structured message array
+  return `
+  <prompt>
+    <agent_prompt>${agentPrompt} </agent_prompt>
+    <context>${stage1Response}</context>
+    <query>${query}</query>
+    <task>${stage2Instructions}</task>
+    <history>${chatHistory.map((msg) => msg.text).join("\n")}</history>
+  </prompt>
+  `; // Return the structured message array
 }
 
 // Function to map group title to scenario type
@@ -386,7 +380,7 @@ export async function handleWhatToAskController(req, res) {
     console.log("Stage 2: Filtered chatHistory count:", chatHistory.length);
 
     // Use getStage2Prompt to construct the message array for the LLM
-    const messages = getStage2Prompt(
+    const stage2Instructions = getStage2Prompt(
       stage1Response,
       chatHistory, // Pass retrieved history
       query,
@@ -396,7 +390,9 @@ export async function handleWhatToAskController(req, res) {
 
     // Use Settings.llm configured for streaming for the final output
     const finalResultStream = await Settings.llm.chat({
-      messages: messages, // Pass the structured messages array from getStage2Prompt
+      messages: [
+        { role: "user", content: stage2Instructions }, // Pass the structured messages array from getStage2Prompt
+      ],
       stream: true,
     });
 
