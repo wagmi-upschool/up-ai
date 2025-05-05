@@ -143,10 +143,22 @@ function filterByScore(results, minScore = 0.25) {
 
 // Load scenario configurations asynchronously from URL
 let scenarioConfigs = [];
+let lastConfigFetchTime = 0; // Timestamp of the last successful fetch
+const CONFIG_CACHE_DURATION = 60 * 10 * 1000; // 1 hour in milliseconds
 const configUrl =
   "https://raw.githubusercontent.com/wagmi-upschool/mobile-texts/refs/heads/main/rag.json";
 
 async function loadScenarioConfigs() {
+  const now = Date.now();
+  // Check if cache is still valid
+  if (
+    now - lastConfigFetchTime < CONFIG_CACHE_DURATION &&
+    scenarioConfigs.length > 0
+  ) {
+    console.log("Using cached scenario configurations.");
+    return; // Use cached data
+  }
+
   console.log(`Fetching scenario configurations from ${configUrl}...`);
   try {
     const response = await fetch(configUrl);
@@ -155,20 +167,31 @@ async function loadScenarioConfigs() {
     }
     const data = await response.json();
     scenarioConfigs = data.scenarios; // Assuming the structure is { scenarios: [...] }
-    console.log("Scenario configurations loaded successfully.");
+    lastConfigFetchTime = now; // Update timestamp on successful fetch
+    console.log("Scenario configurations loaded/refreshed successfully.");
   } catch (error) {
     console.error("Error loading scenarioConfig from URL:", error);
     // Fallback or default configuration could be set here if needed
-    scenarioConfigs = [
-      {
-        id: "General",
-        taskInstructions:
-          "Provide a clear and contextual response based on the provided information.",
-        stage2Instructions:
-          "Refine the prepared response for continuity and clarity. Always answer in Turkish",
-      },
-    ];
-    console.warn("Using default scenario configurations due to fetch error.");
+    // If fetch fails, retain potentially stale data but log the error.
+    // Only reset to default if scenarioConfigs is empty.
+    if (scenarioConfigs.length === 0) {
+      scenarioConfigs = [
+        {
+          id: "General",
+          taskInstructions:
+            "Provide a clear and contextual response based on the provided information.",
+          stage2Instructions:
+            "Refine the prepared response for continuity and clarity. Always answer in Turkish",
+        },
+      ];
+      console.warn(
+        "Using default scenario configurations due to fetch error on initial load."
+      );
+    } else {
+      console.warn(
+        "Using potentially stale scenario configurations due to fetch error."
+      );
+    }
   }
 }
 
@@ -285,6 +308,9 @@ export async function handleWhatToAskController(req, res) {
   const { query, assistantId, type, stage } = req.body;
 
   try {
+    // Ensure latest scenario configs are loaded (respecting cache duration)
+    await loadScenarioConfigs();
+
     const systemMessage = await fetchAssistantConfig(assistantId, stage);
     if (!systemMessage || !systemMessage.prompt)
       throw new Error("Assistant configuration or prompt not found");
