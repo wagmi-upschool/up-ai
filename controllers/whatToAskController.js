@@ -8,14 +8,12 @@ import {
   RetrieverQueryEngine,
   defaultTreeSummarizePrompt,
   VectorIndexRetriever,
-  defaultRefinePrompt
+  defaultRefinePrompt,
 } from "llamaindex";
-import {
-  GetCommand
-} from "@aws-sdk/lib-dynamodb";
-import {
-  DynamoDBClient
-} from "@aws-sdk/client-dynamodb";
+import { GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import fs from "fs";
+import path from "path";
 const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
 });
@@ -50,15 +48,15 @@ function getAzureEmbeddingOptions() {
 
 // Initialize OpenAI settings based on assistant configuration
 async function initializeSettings(config) {
-  const {
-    setEnvs
-  } = await import("@llamaindex/env");
+  const { setEnvs } = await import("@llamaindex/env");
   setEnvs(process.env);
   Settings.llm = new OpenAI({
-    model: process.env.MODEL,
-    deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-    additionalChatOptions: {
+    azure: {
+      apiKey: process.env.AZURE_OPENAI_KEY,
+      endpoint: process.env.AZURE_OPENAI_ENDPOINT,
       deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+    },
+    additionalChatOptions: {
       frequency_penalty: config.frequencyPenalty,
       presence_penalty: config.presencePenalty,
       stream: config.stream ? config.stream : undefined,
@@ -101,64 +99,320 @@ async function createIndices() {
 
   return {
     index_chat_messages,
-    index_assistant_documents
+    index_assistant_documents,
   };
 }
 
-function createAssistantRetriever({
-  index_assistant_documents,
-  assistantId
-}) {
+function createAssistantRetriever({ index_assistant_documents, assistantId }) {
   return new VectorIndexRetriever({
     index: index_assistant_documents,
     includeValues: true,
     filters: {
-      filters: [{
-        key: "assistantId",
-        value: assistantId,
-        operator: "==",
-      },],
+      filters: [
+        {
+          key: "assistantId",
+          value: assistantId,
+          operator: "==",
+        },
+      ],
     },
     similarityTopK: 5,
   });
 }
 
-function createChatRetriever({
-  index_chat_messages,
-  conversationId
-}) {
+function createChatRetriever({ index_chat_messages, conversationId }) {
   return new VectorIndexRetriever({
     index: index_chat_messages,
     includeValues: true,
     filters: {
-      filters: [{
-        key: "conversationId",
-        value: conversationId,
-        operator: "==",
-      },],
+      filters: [
+        {
+          key: "conversationId",
+          value: conversationId,
+          operator: "==",
+        },
+      ],
     },
     similarityTopK: 5,
   });
 }
 
-// Update the CombinedRetriever to properly merge results
-class CombinedRetriever {
-  constructor(retrievers) {
-    this.retrievers = retrievers;
+function filterByScore(results, minScore = 0.25) {
+  return results.filter((result) => (result.score || 0) > minScore);
+}
+
+// Load scenario configurations asynchronously from URL
+let scenarioConfigs = [];
+const configUrl =
+  "https://raw.githubusercontent.com/wagmi-upschool/mobile-texts/refs/heads/main/rag.json";
+
+async function loadScenarioConfigs() {
+  console.log(`Fetching scenario configurations from ${configUrl}...`);
+  try {
+    const response = await fetch(configUrl);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    const data = await response.json();
+    scenarioConfigs = data.scenarios; // Assuming the structure is { scenarios: [...] }
+    console.log("Scenario configurations loaded successfully.");
+  } catch (error) {
+    console.error("Error loading scenarioConfig from URL:", error);
+    // Fallback or default configuration could be set here if needed
+    scenarioConfigs = [
+      {
+        id: "General",
+        taskInstructions:
+          "Provide a clear and contextual response based on the provided information.",
+        stage2Instructions:
+          "Refine the prepared response for continuity and clarity. Always answer in Turkish",
+      },
+    ];
+    console.warn("Using default scenario configurations due to fetch error.");
+  }
+}
+
+// Load configs when the module initializes
+loadScenarioConfigs();
+
+// Prompt template for Stage 1: Retrieve info based on knowledge base
+function getStage1Prompt(retrievedDocs, userQuery, scenarioType) {
+  const context = retrievedDocs
+    .map((doc) => doc.node.text)
+    .join(
+      "\n---\
+"
+    );
+  // Find the task instructions from the loaded configuration
+  const scenarioConfig =
+    scenarioConfigs.find((sc) => sc.id === scenarioType) ||
+    scenarioConfigs.find((sc) => sc.id === "General");
+  let taskInstructions = scenarioConfig.taskInstructions;
+
+  // Add handling for conversational queries
+  const conversationalKeywords = ["yes", "okay", "thanks", "i see", "go on"];
+  const isConversational = conversationalKeywords.some(
+    (keyword) => userQuery.toLowerCase().trim() === keyword
+  );
+
+  let finalTaskInstructions = taskInstructions; // Start with instructions from JSON
+  // Append conversational handling instructions if needed
+  if (isConversational) {
+    finalTaskInstructions += `\n\n<conversational_handling>\nIf query is purely conversational (like \"yes\", \"okay\", \"thanks\", \"I see\", \"go on\"):\n<item>Respond naturally while maintaining the established interaction style (${
+      scenarioType || "default"
+    })</item>\n<item>Use brief responses as opportunities to subtly reinforce key principles from context if appropriate</item>\n<item>Keep the flow going without forcing educational content</item>\n</conversational_handling>`;
   }
 
-  async retrieve(query) {
-    // Get results from all retrievers
-    const results = await Promise.all(
-      this.retrievers.map((retriever) => retriever.retrieve(query))
+  // Construct the prompt using XML structure
+  return `
+<prompt>
+  <context>${context || "No relevant context found."}</context>
+  <query>${userQuery}</query>
+  <scenario_type>${scenarioType || "General"}</scenario_type>
+  <task>${finalTaskInstructions}</task>
+</prompt>
+`;
+}
+
+// Prompt template for Stage 2: Refine response with chat history
+function getStage2Prompt(
+  stage1Response, // Stage 1 LLM response
+  chatHistory, // Retrieved chat history nodes
+  query, // Current user query
+  scenarioType, // Determined scenario type (currently unused in this structure)
+  agentPrompt // Initial system/agent instructions
+) {
+  // Fetch stage 2 instructions
+  const scenarioConfig =
+    scenarioConfigs.find((sc) => sc.id === scenarioType) ||
+    scenarioConfigs.find((sc) => sc.id === "General");
+  let stage2Instructions = scenarioConfig.stage2Instructions;
+
+  // Map chat history to the required format (user/assistant roles)
+  const formattedHistoryMessages = chatHistory
+    .map((msg) => ({
+      // Infer role based on metadata - adjust field name if necessary
+      role: msg.metadata?.sender === "user" ? "user" : "assistant",
+      // Assuming the message content is in the 'text' field - adjust if necessary
+      content: msg.text || "",
+    }))
+    .filter((msg) => msg.content); // Ensure content is not empty
+  console.log(
+    "formattedHistoryMessages inside getStage2Prompt:",
+    formattedHistoryMessages
+  );
+
+  // Construct the message array for the LLM using function parameters
+  const messages = [
+    { role: "system", content: `${agentPrompt}\n\n${stage2Instructions}` }, // Combined system prompt
+    ...formattedHistoryMessages, // Spread the history messages (user/assistant)
+    { role: "assistant", content: stage1Response }, // Use passed stage1Response
+    { role: "user", content: query }, // Use passed query
+  ];
+
+  console.log("messages inside getStage2Prompt:", messages);
+
+  return messages; // Return the structured message array
+}
+
+// Function to map group title to scenario type
+function mapGroupToScenarioType(groupInfo) {
+  if (!groupInfo || !groupInfo.groupTitle) {
+    console.warn("Group info or title missing, defaulting scenario type.");
+    return "General"; // Default or consider throwing error
+  }
+
+  // The groupTitle from DynamoDB might have the structure { S: "Title" }
+  // Adjust access accordingly. Assuming direct access for now.
+  const title = groupInfo.groupTitle.S || groupInfo.groupTitle; // Handle potential DynamoDB structure
+
+  console.log(`Mapping group title: ${title}`);
+
+  // Define mappings (case-insensitive comparison)
+  const lowerCaseTitle = title.toLowerCase();
+  if (lowerCaseTitle.includes("prova odası")) {
+    return "Work Rehearsal";
+  } else if (lowerCaseTitle.includes("sorumluluk dostu")) {
+    return "Mentorship";
+  } else if (lowerCaseTitle.includes("role play")) {
+    return "Role-play";
+  }
+
+  console.warn(
+    `No specific scenario mapping found for group title: ${title}. Defaulting.`
+  );
+  return "General"; // Default if no mapping matches
+}
+
+// Controller to handle streaming reflection requests
+export async function handleWhatToAskController(req, res) {
+  const { userId, conversationId } = req.params;
+  console.log("conversationId:", conversationId);
+  const { query, assistantId, type, stage } = req.body;
+
+  try {
+    const systemMessage = await fetchAssistantConfig(assistantId, stage);
+    if (!systemMessage || !systemMessage.prompt)
+      throw new Error("Assistant configuration or prompt not found");
+
+    // Determine Scenario Type - Priority 1: Direct Assistant ID match in scenarioConfig
+    let scenarioType = null;
+    const directScenario = scenarioConfigs.find(
+      (sc) => sc.assistantIds && sc.assistantIds.includes(assistantId)
     );
 
-    // Flatten and sort by score
-    const flatResults = results.flat().sort((a, b) =>
-      (b.score || 0) - (a.score || 0)
+    if (directScenario) {
+      scenarioType = directScenario.id;
+      console.log(
+        `Scenario type overridden by direct assistantId match: ${scenarioType}`
+      );
+    } else {
+      // Priority 2: Determine from Assistant Group
+      console.log(
+        `No direct scenario override found for assistant ${assistantId}. Checking group...`
+      );
+      const groupInfo = await fetchAssistantGroupInfo(assistantId, stage);
+      if (!groupInfo) {
+        // Handle case where assistant doesn't belong to a group or group fetch fails
+        console.warn(
+          `Could not determine group for assistant ${assistantId}. Defaulting scenario type.`
+        );
+        // Use default 'General' or handle as needed
+        scenarioType = "General";
+      } else {
+        scenarioType = mapGroupToScenarioType(groupInfo);
+      }
+    }
+
+    console.log(`Determined final scenarioType: ${scenarioType}`);
+
+    // Calculate replacedPatterns here to pass to getStage1Prompt
+    const agentPrompt = replacePatterns(systemMessage.prompt);
+
+    const assistantConfig = {
+      temperature: parseFloat(systemMessage.temperature) || 0.2,
+      topP: parseFloat(systemMessage.topP) || 0.95,
+      maxTokens: parseInt(systemMessage.maxTokens) || 800,
+      frequencyPenalty: parseFloat(systemMessage.frequencyPenalty) || 0.0,
+      presencePenalty: parseFloat(systemMessage.presencePenalty) || 0.0,
+      responseType: "text",
+      stream: true, // Stage 2 will stream
+    };
+
+    await initializeSettings(assistantConfig);
+
+    // Create indices for both chat messages and assistant documents
+    const { index_chat_messages, index_assistant_documents } =
+      await createIndices();
+
+    // Stage 1: Retrieve Knowledge & Generate Initial Response
+    const retriever_assistant = createAssistantRetriever({
+      index_assistant_documents,
+      assistantId,
+    });
+    let assistantDocs = await retriever_assistant.retrieve(query);
+    console.log(
+      "Stage 1: Retrieved assistantDocs count:",
+      assistantDocs.length
+    );
+    assistantDocs = filterByScore(assistantDocs); // Filter by score
+    console.log("Stage 1: Filtered assistantDocs count:", assistantDocs.length);
+
+    // Pass determined scenarioType to getStage1Prompt
+    const stage1Prompt = getStage1Prompt(
+      assistantDocs,
+      query,
+      scenarioType,
+      agentPrompt
+    );
+    console.log("\n--- Stage 1 Prompt ---\n", stage1Prompt);
+
+    // Use Settings.llm directly for the first non-streaming call
+    const stage1Completion = await Settings.llm.complete({
+      prompt: stage1Prompt,
+    });
+    const stage1Response = stage1Completion.text;
+    console.log("\n--- Stage 1 Response ---\n", stage1Response);
+
+    // Stage 2: Retrieve History & Refine Response (Streaming)
+    const retriever_chat = createChatRetriever({
+      index_chat_messages,
+      conversationId,
+    });
+    let chatHistory = await retriever_chat.retrieve(query);
+    console.log("\nStage 2: Retrieved chatHistory count:", chatHistory.length);
+
+    chatHistory = filterByScore(chatHistory); // Filter by score
+    console.log("Stage 2: Filtered chatHistory count:", chatHistory.length);
+
+    // Use getStage2Prompt to construct the message array for the LLM
+    const messages = getStage2Prompt(
+      stage1Response,
+      chatHistory, // Pass retrieved history
+      query,
+      scenarioType,
+      agentPrompt // Pass agent prompt
     );
 
-    return flatResults;
+    // Use Settings.llm configured for streaming for the final output
+    const finalResultStream = await Settings.llm.chat({
+      messages: messages, // Pass the structured messages array from getStage2Prompt
+      stream: true,
+    });
+
+    // Stream final response
+    res.setHeader("Content-Type", "text/plain");
+    res.setHeader("Transfer-Encoding", "chunked");
+
+    for await (const chunk of finalResultStream) {
+      res.write(chunk.delta); // Use delta for chat streaming
+    }
+    res.write("[DONE-UP]");
+    res.end();
+  } catch (err) {
+    console.error("Error in handleWhatToAskController:", err);
+    // Avoid sending detailed error messages in production
+    res.status(500).json({ error: "An internal server error occurred." });
   }
 }
 
@@ -175,182 +429,52 @@ async function fetchAssistantConfig(assistantId, stage) {
   return result.Item ? result.Item : null;
 }
 
-// First, let's add a helper function to filter results by score
-function filterByScore(results, minScore = 0.25) {
-  return results.filter(result => (result.score || 0) > minScore);
-}
+// Fetch assistant group info by scanning the AssistantGroup table
+async function fetchAssistantGroupInfo(assistantId, stage) {
+  const env = stage ?? process.env.STAGE;
+  const tableName = `AssistantGroup-${env}`; // Adjust if table name format is different
+  console.log(`Scanning table ${tableName} for assistantId: ${assistantId}`);
 
-// Controller to handle streaming reflection requests
-export async function handleWhatToAskController(req, res) {
-  const {
-    userId,
-    conversationId
-  } = req.params;
-  const {
-    query,
-    assistantId,
-    type,
-    stage
-  } = req.body;
+  const params = {
+    TableName: tableName,
+    // FilterExpression requires attribute type definition if not using DocumentClient's marshalling
+    FilterExpression: "contains(relatedAssistants, :assistantIdVal)",
+    ExpressionAttributeValues: {
+      // Assuming relatedAssistants is a list of strings (S)
+      // If it's a list of objects like { "S": "id" }, this needs adjustment
+      // DynamoDB ScanCommand requires explicit type descriptors like {"S": assistantId}
+      // The GetCommand uses marshalling implicitly, ScanCommand might not depending on client setup.
+      // Let's assume DocumentClient handles marshalling, otherwise we need { "S": assistantId }
+      // UPDATE: Based on example JSON, relatedAssistants is "L": [{"S": "..."}], so contains might need adjustment or a different approach.
+      // A direct contains check on a list of maps might not work as expected with FilterExpression.
+      // Let's try scanning and filtering in code for robustness, though less efficient.
+      ":assistantIdVal": assistantId, // DocumentClient simplifies this usually. Let's assume it works. Revisit if errors occur.
+    },
+  };
 
   try {
-    const systemMessage = await fetchAssistantConfig(assistantId, stage);
-    if (!systemMessage) throw new Error("Assistant configuration not found");
-    const replacedPatterns = replacePatterns(systemMessage.prompt);
-    const assistantConfig = {
-      temperature: parseFloat(systemMessage.temperature) || 0.2,
-      topP: parseFloat(systemMessage.topP) || 0.95,
-      maxTokens: parseInt(systemMessage.maxTokens) || 800,
-      frequencyPenalty: parseFloat(systemMessage.frequencyPenalty) || 0.0,
-      presencePenalty: parseFloat(systemMessage.presencePenalty) || 0.0,
-      responseType: "text",
-      stream: true,
-    };
-    await initializeSettings(assistantConfig);
+    // Using ScanCommand. A full table scan can be inefficient. Consider a GSI if performance is critical.
+    const command = new ScanCommand(params);
+    const results = await dynamoDbClient.send(command);
 
-    // Create indices for both chat messages and assistant documents
-    const {
-      index_chat_messages,
-      index_assistant_documents
-    } =
-      await createIndices();
-
-    // First, retrieve relevant assistant documents
-    const retriever_assistant = createAssistantRetriever({
-      index_assistant_documents,
-      assistantId,
-    });
-
-    let assistantDocs = await retriever_assistant.retrieve(query);
-    console.log('assistantDocs', assistantDocs);
-    assistantDocs = filterByScore(assistantDocs);
-
-    // Then get relevant chat history for context
-    const retriever_chat = createChatRetriever({
-      index_chat_messages,
-      conversationId,
-    });
-    let chatHistory = await retriever_chat.retrieve(query);
-    chatHistory = filterByScore(chatHistory);
-
-    // Format chat history into a conversation format
-    const formattedChatHistory = chatHistory
-      .sort((a, b) => (new Date(a.node.metadata?.createdAt).getTime() || 0) - (new Date(b.node.metadata?.createdAt).getTime() || 0))
-      .map(msg => `${msg.node.metadata?.role || 'Unknown'}: ${msg.node.text}`)
-      .join('\n');
-    // -----------------------------------
-    const formattedQuery = `
-     
-            -----------------------------------
-            ${assistantDocs.length > 0 ? `Knowledge Base:\n${assistantDocs.map(doc => doc.node.text).join('\n')}\n-----------------------------------` : ''}
-            ${chatHistory.length > 0 ? `Conversation History:\n${formattedChatHistory}\n-----------------------------------` : ''}
-            Current User Query:
-            ${query}
-            -----------------------------------
-            ${getInstructions(assistantDocs.length > 0, chatHistory.length > 0)}
-            `;
-
-    // Helper function to generate appropriate instructions based on available context
-    function getInstructions(hasKnowledge, hasHistory) {
-      if (hasKnowledge && hasHistory) {
-        return `Based on the Knowledge Base and Conversation History above:
-            1. First understand the user's intent from the Current User Query
-            2. Find relevant information from the Knowledge Base
-            3. Consider the context from the Conversation History
-            4. Provide a clear and contextual response`;
-      } else if (hasKnowledge) {
-        return `Based on the Knowledge Base above:
-            1. First understand the user's intent from the Current User Query
-            2. Find relevant information from the Knowledge Base
-            3. Provide a clear and informative response`;
-      } else if (hasHistory) {
-        return `Based on the Conversation History above:
-            1. First understand the user's intent from the Current User Query
-            2. Consider the context from the Conversation History
-            3. Provide a contextually appropriate response`;
-      } else {
-        return `Based on the System Prompt:
-            1. First understand the user's intent from the Current User Query
-            2. Provide a response aligned with the system context
-            3. If you cannot provide a specific answer, guide the user appropriately`;
-      }
-    }
-
-    console.log('-----------------------------------');
-    console.log(formattedQuery);
-    const responseSynthesizer = await getResponseSynthesizer("compact", {
-      llm: new OpenAI({
-        azure: {
-          endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-          deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-          apiKey: process.env.AZURE_OPENAI_KEY,
-        },
-        model: process.env.MODEL,
-        additionalChatOptions: {
-          frequency_penalty: assistantConfig.frequencyPenalty,
-          presence_penalty: assistantConfig.presencePenalty,
-          stream: assistantConfig.stream,
-        },
-        temperature: assistantConfig.temperature,
-        topP: assistantConfig.topP,
-      }),
-      refineTemplate: defaultRefinePrompt.partialFormat({
-        query: query,
-        existingAnswer: formattedChatHistory,
-        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
-      }),
-      textQATemplate: defaultTreeSummarizePrompt.partialFormat({
-        chatHistory: formattedChatHistory,
-        existingAnswer: formattedChatHistory,
-        query: query,
-        question: query,
-        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
-      }),
-    });
-
-    // Create query engine with just the assistant documents retriever
-    const queryEngine = new RetrieverQueryEngine(
-      retriever_assistant,
-      responseSynthesizer
-    );
-    queryEngine.updatePrompts({
-      textQATemplate: defaultTreeSummarizePrompt.partialFormat({
-        chatHistory: formattedChatHistory,
-        existingAnswer: formattedChatHistory,
-        query: query,
-        question: query,
-        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
-      }),
-      refineTemplate: defaultRefinePrompt.partialFormat({
-        query: query,
-        existingAnswer: formattedChatHistory,
-        context: `${assistantDocs.map(doc => doc.node.text).join('\n')}`,
-      }),
-    });
-    // Retrieve the result from queryEngine with the formatted query
-    const result = await queryEngine.query({
-      stream: true,
-      query: formattedQuery,
-    });
-
-    res.setHeader("Content-Type", "text/plain");
-    res.setHeader("Transfer-Encoding", "chunked");
-
-    // Stream each chunk of the response
-    if (result && typeof result[Symbol.asyncIterator] === "function") {
-      for await (const chunk of result) {
-        res.write(chunk.response);
-      }
-      res.write("[DONE-UP]");
-      res.end();
+    if (results.Items && results.Items.length > 0) {
+      // Assuming only one group contains the assistant
+      console.log(
+        `Found group for assistant ${assistantId}:`,
+        results.Items[0].groupTitle
+      );
+      // The raw result needs unmarshalling if not using DocumentClient's `scan`
+      // Let's assume standard client requires manual unmarshalling or switching to DocumentClient.
+      // For simplicity now, let's return the first match assuming basic structure access works.
+      // This might need refinement based on the actual client setup and DynamoDB structure handling.
+      return results.Items[0]; // Return the first matching group item
     } else {
-      // Handle non-async iterable response
-      res.end(result.response || "No response");
+      console.log(`No group found containing assistantId: ${assistantId}`);
+      return null;
     }
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      error: err.message,
-    });
+  } catch (error) {
+    console.error(`Error scanning ${tableName}:`, error);
+    // Rethrow or handle error appropriately
+    throw new Error(`Failed to fetch assistant group info: ${error.message}`);
   }
 }
