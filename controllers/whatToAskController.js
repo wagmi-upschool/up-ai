@@ -257,10 +257,11 @@ If the query is a purely conversational Turkish expression (e.g., "selam", "merh
 // Prompt template for Stage 2: Refine response with chat history
 function getStage2Prompt(
   stage1Response, // Stage 1 LLM response
-  chatHistory, // Retrieved chat history nodes
+  chatHistory, // Retrieved chat history nodes (NodeWithScore[])
   query, // Current user query
   scenarioType, // Determined scenario type
-  agentPrompt // Initial system/agent instructions
+  agentPrompt, // Initial system/agent instructions
+  summarizedHistoryText // Summarized history text
 ) {
   // Fetch stage 2 instructions
   const scenarioConfig =
@@ -288,22 +289,19 @@ function getStage2Prompt(
   const messages = [
     {
       role: "system",
-      content: `${agentPrompt}
-${stage2Instructions}`, // Combine agent prompt and task instructions
+      content: `${agentPrompt} ${stage2Instructions}`, // Combine agent prompt and task instructions
     },
     {
       role: "system",
       content:
         "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n",
     },
-    // Add history messages
+    { role: "memory", content: summarizedHistoryText },
     ...formattedHistoryMessages,
-    // Add the Stage 1 response as an assistant message to be refined
     {
       role: "assistant",
       content: stage1Response,
     },
-    // Add the current user query
     {
       role: "user",
       content: query,
@@ -435,11 +433,38 @@ export async function handleWhatToAskController(req, res) {
       index_chat_messages,
       conversationId,
     });
-    let chatHistory = await retriever_chat.retrieve(query);
-    console.log("\nStage 2: Retrieved chatHistory count:", chatHistory.length);
+    let fullChatHistory = await retriever_chat.retrieve(query);
+    console.log(
+      "\nStage 2: Retrieved chatHistory count:",
+      fullChatHistory.length
+    );
 
-    chatHistory = filterByScore(chatHistory); // Filter by score
+    let chatHistory = filterByScore(fullChatHistory); // Filter by score
     console.log("Stage 2: Filtered chatHistory count:", chatHistory.length);
+
+    let summarizedHistoryText = "";
+    // Summarize chat history if it exceeds 5 messages
+
+    console.log(
+      `Chat history has ${chatHistory.length} messages, exceeding 5. Summarizing...`
+    );
+
+    const summarizer = getResponseSynthesizer(
+      "tree_summarize", // Specify the tree_summarize strategy
+      {
+        llm: Settings.llm, // Use the existing Settings.llm
+        // summaryTemplate: defaultTreeSummarizePrompt, // Optional: to be more explicit, can be added if needed
+      }
+    );
+
+    const summaryResponse = await summarizer.synthesize({
+      query:
+        "Concisely summarize the key points of the following conversation history. This summary will serve as context for the next turn in the conversation.",
+      nodes: fullChatHistory, // chatHistory items are NodeWithScore[]
+    });
+
+    summarizedHistoryText = summaryResponse.response;
+    console.log("Summarized chat history text:", summarizedHistoryText);
 
     // Use getStage2Prompt to construct the message array for the LLM
     const stage2Messages = getStage2Prompt(
@@ -447,7 +472,8 @@ export async function handleWhatToAskController(req, res) {
       chatHistory, // Pass retrieved history
       query,
       scenarioType,
-      agentPrompt // Pass agent prompt
+      agentPrompt,
+      summarizedHistoryText // Pass summarized history text
     );
     console.log(
       "\n--- Stage 2 Messages ---\n",
