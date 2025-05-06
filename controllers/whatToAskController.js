@@ -211,25 +211,42 @@ function getStage1Prompt(retrievedDocs, userQuery, scenarioType) {
     scenarioConfigs.find((sc) => sc.id === scenarioType) ||
     scenarioConfigs.find((sc) => sc.id === "General");
   let taskInstructions = scenarioConfig.taskInstructions;
+  let finalTaskInstructions = taskInstructions;
 
   // Add handling for conversational queries
-  const conversationalKeywords = ["yes", "okay", "thanks", "i see", "go on"];
+  const conversationalKeywords = [
+    "selam",
+    "merhaba",
+    "naber",
+    "devam et",
+    "tamam",
+    "evet",
+    "hayır",
+  ];
   const isConversational = conversationalKeywords.some(
     (keyword) => userQuery.toLowerCase().trim() === keyword
   );
 
-  let finalTaskInstructions = taskInstructions; // Start with instructions from JSON
   // Append conversational handling instructions if needed
   if (isConversational) {
-    finalTaskInstructions += `\n\n<conversational_handling>\nIf query is purely conversational (like \"yes\", \"okay\", \"thanks\", \"I see\", \"go on\"):\n<item>Respond naturally while maintaining the established interaction style (${
-      scenarioType || "default"
-    })</item>\n<item>Use brief responses as opportunities to subtly reinforce key principles from context if appropriate</item>\n<item>Keep the flow going without forcing educational content</item>\n</conversational_handling>`;
+    finalTaskInstructions += `
+
+<conversational_handling>
+If the query is a purely conversational Turkish expression (e.g., "selam", "merhaba", "naber", "devam et", "tamam", "evet", "hayır"):
+<item>For greetings (e.g., "selam", "merhaba", "naber"): Respond naturally and briefly. Do not use the provided context for your response.</item>
+<item>For continuation phrases (e.g., "devam et", "tamam"): Continue the previous conversational flow or provide a brief acknowledgment to allow the user to continue. Do not use the provided context unless directly relevant to continuing the flow.</item>
+<item>For affirmations/negations (e.g., "evet", "hayır"): Acknowledge the user's input and maintain the current conversational context. Do not use the provided context to introduce new topics.</item>
+</conversational_handling>`;
   }
 
   // Construct the prompt using XML structure
   return `
 <prompt>
-  <context>${context || "No relevant context found."}</context>
+  <context>${
+    isConversational
+      ? "No relevant context found."
+      : context || "No relevant context found."
+  }</context>
   <query>${userQuery}</query>
   <scenario_type>${scenarioType || "General"}</scenario_type>
   <task>${finalTaskInstructions}</task>
@@ -242,7 +259,7 @@ function getStage2Prompt(
   stage1Response, // Stage 1 LLM response
   chatHistory, // Retrieved chat history nodes
   query, // Current user query
-  scenarioType, // Determined scenario type (currently unused in this structure)
+  scenarioType, // Determined scenario type
   agentPrompt // Initial system/agent instructions
 ) {
   // Fetch stage 2 instructions
@@ -253,23 +270,47 @@ function getStage2Prompt(
 
   // Map chat history to the required format (user/assistant roles)
   const formattedHistoryMessages = chatHistory
-    .map((msg) => ({
+    .map((msg) => {
       // Infer role based on metadata - adjust field name if necessary
-      role: msg.metadata?.sender === "user" ? "user" : "assistant",
-      // Assuming the message content is in the 'text' field - adjust if necessary
-      content: msg.text || "",
-    }))
-    .filter((msg) => msg.content); // Ensure content is not empty
+      // Ensure content exists before creating the message object
+      const content = msg.text || "";
+      if (!content) {
+        return null; // Skip messages with empty content
+      }
+      return {
+        role: msg.metadata?.sender === "user" ? "user" : "assistant",
+        content: content,
+      };
+    })
+    .filter((msg) => msg !== null); // Remove null entries
 
-  return `
-  <prompt>
-    <agent_prompt>${agentPrompt} </agent_prompt>
-    <context>${stage1Response}</context>
-    <query>${query}</query>
-    <task>${stage2Instructions}</task>
-    <history>${chatHistory.map((msg) => msg.text).join("\n")}</history>
-  </prompt>
-  `; // Return the structured message array
+  // Construct the message array
+  const messages = [
+    {
+      role: "system",
+      content: `${agentPrompt}
+${stage2Instructions}`, // Combine agent prompt and task instructions
+    },
+    {
+      role: "system",
+      content:
+        "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n",
+    },
+    // Add history messages
+    ...formattedHistoryMessages,
+    // Add the Stage 1 response as an assistant message to be refined
+    {
+      role: "assistant",
+      content: stage1Response,
+    },
+    // Add the current user query
+    {
+      role: "user",
+      content: query,
+    },
+  ];
+
+  return messages; // Return the structured message array
 }
 
 // Function to map group title to scenario type
@@ -379,12 +420,7 @@ export async function handleWhatToAskController(req, res) {
     console.log("Stage 1: Filtered assistantDocs count:", assistantDocs.length);
 
     // Pass determined scenarioType to getStage1Prompt
-    const stage1Prompt = getStage1Prompt(
-      assistantDocs,
-      query,
-      scenarioType,
-      agentPrompt
-    );
+    const stage1Prompt = getStage1Prompt(assistantDocs, query, scenarioType);
     console.log("\n--- Stage 1 Prompt ---\n", stage1Prompt);
 
     // Use Settings.llm directly for the first non-streaming call
@@ -406,19 +442,21 @@ export async function handleWhatToAskController(req, res) {
     console.log("Stage 2: Filtered chatHistory count:", chatHistory.length);
 
     // Use getStage2Prompt to construct the message array for the LLM
-    const stage2Instructions = getStage2Prompt(
+    const stage2Messages = getStage2Prompt(
       stage1Response,
       chatHistory, // Pass retrieved history
       query,
       scenarioType,
       agentPrompt // Pass agent prompt
     );
+    console.log(
+      "\n--- Stage 2 Messages ---\n",
+      JSON.stringify(stage2Messages, null, 2)
+    );
 
     // Use Settings.llm configured for streaming for the final output
     const finalResultStream = await Settings.llm.chat({
-      messages: [
-        { role: "user", content: stage2Instructions }, // Pass the structured messages array from getStage2Prompt
-      ],
+      messages: stage2Messages, // Pass the structured messages array directly
       stream: true,
     });
 
