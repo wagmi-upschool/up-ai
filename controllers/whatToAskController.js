@@ -55,6 +55,7 @@ async function initializeSettings(config) {
       apiKey: process.env.AZURE_OPENAI_KEY,
       endpoint: process.env.AZURE_OPENAI_ENDPOINT,
       deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+      model: process.env.MODEL,
     },
     additionalChatOptions: {
       frequency_penalty: config.frequencyPenalty,
