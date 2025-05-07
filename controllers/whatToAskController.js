@@ -179,9 +179,9 @@ async function loadScenarioConfigs() {
       scenarioConfigs = [
         {
           id: "General",
-          taskInstructions:
+          Stage1DocInstructions:
             "Provide a clear and contextual response based on the provided information.",
-          stage2Instructions:
+          Stage2HistoryInstructions:
             "Refine the prepared response for continuity and clarity. Always answer in Turkish",
         },
       ];
@@ -211,7 +211,7 @@ function getStage1Prompt(retrievedDocs, userQuery, scenarioType) {
   const scenarioConfig =
     scenarioConfigs.find((sc) => sc.id === scenarioType) ||
     scenarioConfigs.find((sc) => sc.id === "General");
-  let taskInstructions = scenarioConfig.taskInstructions;
+  let taskInstructions = scenarioConfig.Stage1DocInstructions;
   let finalTaskInstructions = taskInstructions;
 
   // Add handling for conversational queries
@@ -268,7 +268,7 @@ function getStage2Prompt(
   const scenarioConfig =
     scenarioConfigs.find((sc) => sc.id === scenarioType) ||
     scenarioConfigs.find((sc) => sc.id === "General");
-  let stage2Instructions = scenarioConfig.stage2Instructions;
+  let stage2Instructions = scenarioConfig.Stage2HistoryInstructions;
 
   // Map chat history to the required format (user/assistant roles)
   const formattedHistoryMessages = chatHistory
@@ -295,7 +295,8 @@ function getStage2Prompt(
     {
       role: "system",
       content:
-        "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n",
+        "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n" +
+        "Language: MUST always answer in Turkish",
     },
     { role: "memory", content: summarizedHistoryText },
     ...formattedHistoryMessages,

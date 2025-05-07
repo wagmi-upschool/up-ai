@@ -14,15 +14,15 @@ Sistem, harici bir JSON dosyası (`https://raw.githubusercontent.com/wagmi-upsch
     {
       "id": "Role-play",
       "assistantIds": [],
-      "taskInstructions": "For ROLE-PLAY scenarios: Stay in character while subtly demonstrating principles from context Model effective behaviors without breaking immersion Let user learn through the experience rather than instruction",
-      "stage2Instructions": "Refine the prepared response to maintain character and role-play dynamics: Adapt tone/reactions based on established character interaction in HISTORY Reference previous HISTORY exchanges to build the narrative Adjust responses based on user's engagement within the role-play in HISTORY Weave in principles from original context naturally within the character's actions/dialogue Keep interaction immersive and focused on the role-play scenario rather than explicit instruction. Always answer in Turkish"
+      "Stage1DocInstructions": "For ROLE-PLAY scenarios: Stay in character while subtly demonstrating principles from context Model effective behaviors without breaking immersion Let user learn through the experience rather than instruction",
+      "Stage2HistoryInstructions": "Refine the prepared response to maintain character and role-play dynamics: Adapt tone/reactions based on established character interaction in HISTORY Reference previous HISTORY exchanges to build the narrative Adjust responses based on user's engagement within the role-play in HISTORY Weave in principles from original context naturally within the character's actions/dialogue Keep interaction immersive and focused on the role-play scenario rather than explicit instruction. Always answer in Turkish"
     },
     // ... diğer senaryolar ...
     {
       "id": "General",
       "assistantIds": [],
-      "taskInstructions": "Provide a clear and contextual response based on the provided information.",
-      "stage2Instructions": "Refine the prepared response for continuity and clarity: Adapt tone based on HISTORY interaction pattern Reference previous topics from HISTORY if relevant Ensure response logically follows from HISTORY Maintain focus on addressing the QUERY clearly. Always answer in Turkish"
+      "Stage1DocInstructions": "Provide a clear and contextual response based on the provided information.",
+      "Stage2HistoryInstructions": "Refine the prepared response for continuity and clarity: Adapt tone based on HISTORY interaction pattern Reference previous topics from HISTORY if relevant Ensure response logically follows from HISTORY Maintain focus on addressing the QUERY clearly. Always answer in Turkish"
     }
   ]
 }
@@ -34,8 +34,8 @@ Her bir senaryo objesi aşağıdaki alanları içerir:
 
 - **`id` (String):** Senaryonun benzersiz tanımlayıcısıdır. Örnek: `"Role-play"`, `"Mentorship"`, `"General"`. Bu `id`, kod içerisinde senaryo tipini belirlemek için kullanılır.
 - **`assistantIds` (Array<String>):** Bu alan, belirli asistan ID'lerinin doğrudan bu senaryoyu kullanmasını sağlar. Eğer gelen istekteki `assistantId` bu dizide bulunuyorsa, diğer senaryo belirleme mekanizmaları (örneğin, grup bazlı belirleme) atlanır ve bu senaryo kullanılır. Bu, "senaryo geçersiz kılma (override)" mekanizmasıdır. Boş bir dizi `[]`, bu senaryonun herhangi bir asistan ID'si için özel olarak atanmadığı anlamına gelir.
-- **`taskInstructions` (String):** Birinci aşama (Stage 1) LLM çağrısı için temel görev talimatlarıdır. Bu talimatlar, LLM'in kullanıcı sorgusuna ve bilgi tabanından alınan belgelere dayanarak nasıl bir ilk yanıt oluşturması gerektiğini tanımlar. Her senaryo için farklılaşan bu talimatlar, yanıtın amacını ve stilini belirler.
-- **`stage2Instructions` (String):** İkinci aşama (Stage 2) LLM çağrısı için talimatlardır. Bu aşamada, birinci aşamada oluşturulan yanıt, sohbet geçmişi kullanılarak iyileştirilir. `stage2Instructions`, LLM'e bu iyileştirmeyi yaparken nelere dikkat etmesi gerektiğini (örneğin, karakter tutarlılığı, önceki konuşmalara referans verme, Türkçe cevap verme zorunluluğu) belirtir.
+- **`Stage1DocInstructions` (String):** Birinci aşama (Stage 1) LLM çağrısı için temel görev talimatlarıdır. Bu talimatlar, LLM'in kullanıcı sorgusuna ve bilgi tabanından alınan belgelere dayanarak nasıl bir ilk yanıt oluşturması gerektiğini tanımlar. Her senaryo için farklılaşan bu talimatlar, yanıtın amacını ve stilini belirler.
+- **`Stage2HistoryInstructions` (String):** İkinci aşama (Stage 2) LLM çağrısı için talimatlardır. Bu aşamada, birinci aşamada oluşturulan yanıt, sohbet geçmişi kullanılarak iyileştirilir. `Stage2HistoryInstructions`, LLM'e bu iyileştirmeyi yaparken nelere dikkat etmesi gerektiğini (örneğin, karakter tutarlılığı, önceki konuşmalara referans verme, Türkçe cevap verme zorunluluğu) belirtir.
 
 ### Senaryo Belirleme ve Geçersiz Kılma (Override)
 
@@ -55,15 +55,15 @@ Bu fonksiyon, RAG akışının ilk aşaması için LLM'e gönderilecek olan prom
 
 - `retrievedDocs` (Array): Bilgi tabanından (asistan dokümanları) kullanıcı sorgusuyla eşleşen ve puana göre filtrelenmiş dokümanların (NodeWithScore objeleri) bir dizisidir. Bu dokümanların metin içerikleri context olarak kullanılır.
 - `userQuery` (String): Kullanıcının sorduğu orijinal soru veya ifade.
-- `scenarioType` (String): Belirlenmiş olan senaryo ID'si (örneğin, `"Role-play"`, `"General"`). Bu, `taskInstructions`'ın doğru senaryo yapılandırmasından alınmasını sağlar.
+- `scenarioType` (String): Belirlenmiş olan senaryo ID'si (örneğin, `"Role-play"`, `"General"`). Bu, `Stage1DocInstructions`'ın doğru senaryo yapılandırmasından alınmasını sağlar.
 
 **İşleyişi ve Özellikleri:**
 
 1.  **Context Oluşturma:** `retrievedDocs` içerisindeki her bir dokümanın metin içeriği (`doc.node.text`) birleştirilerek genel bir bağlam (`context`) oluşturulur.
-2.  **Task Talimatlarını Alma:** `scenarioType` kullanılarak `scenarioConfigs` içerisinden ilgili senaryonun `taskInstructions` talimatı alınır. Eğer belirtilen `scenarioType` bulunamazsa, `"General"` senaryosunun talimatları kullanılır.
+2.  **Task Talimatlarını Alma:** `scenarioType` kullanılarak `scenarioConfigs` içerisinden ilgili senaryonun `Stage1DocInstructions` talimatı alınır. Eğer belirtilen `scenarioType` bulunamazsa, `"General"` senaryosunun talimatları kullanılır.
 3.  **Konuşma Tarzı Sorgu Yönetimi (Conversational Handling):**
     - Kullanıcı sorgusu, `conversationalKeywords` dizisindeki basit konuşma ifadeleriyle (örneğin, "selam", "merhaba", "tamam", "devam et") karşılaştırılır.
-    - Eğer sorgu bu tür bir ifadeyse (`isConversational = true`), `taskInstructions`'a ek özel talimatlar eklenir. Bu talimatlar, LLM'in bu tür ifadelere doğal ve kısa yanıtlar vermesini, bağlamı kullanmamasını veya önceki konuşma akışını sürdürmesini söyler.
+    - Eğer sorgu bu tür bir ifadeyse (`isConversational = true`), `Stage1DocInstructions`'a ek özel talimatlar eklenir. Bu talimatlar, LLM'in bu tür ifadelere doğal ve kısa yanıtlar vermesini, bağlamı kullanmamasını veya önceki konuşma akışını sürdürmesini söyler.
     - Eğer sorgu konuşma tarzı bir ifade ise, prompt içerisindeki `<context>` alanı `"No relevant context found."` olarak ayarlanır. Aksi halde, `retrievedDocs`'tan oluşturulan `context` kullanılır.
 4.  **XML Yapısında Prompt:** Prompt, LLM'in girdiyi daha iyi ayrıştırabilmesi için XML benzeri bir yapıda oluşturulur:
     ```xml
@@ -86,16 +86,16 @@ Bu fonksiyon, RAG akışının ikinci ve son aşaması için LLM'e gönderilecek
 - `stage1Response` (String): İlk LLM çağrısından (Stage 1) dönen ham yanıt metni.
 - `chatHistory` (Array): Kullanıcı sorgusuyla en alakalı bulunan ve puana göre filtrelenmiş son 5 sohbet mesajını içeren `NodeWithScore` dizisi.
 - `query` (String): Kullanıcının mevcut sorgusu.
-- `scenarioType` (String): Belirlenmiş olan senaryo ID'si. Bu, `stage2Instructions`'ın doğru senaryo yapılandırmasından alınmasını sağlar.
+- `scenarioType` (String): Belirlenmiş olan senaryo ID'si. Bu, `Stage2HistoryInstructions`'ın doğru senaryo yapılandırmasından alınmasını sağlar.
 - `agentPrompt` (String): Asistanın temel sistem prompt'u (genellikle asistanın kimliğini, genel davranış kurallarını içerir). Bu, `fetchAssistantConfig` ile alınıp `replacePatterns` ile temizlenir.
 - `summarizedHistoryText` (String): Uzun sohbet geçmişlerinin özetlenmiş hali.
 
 **İşleyişi ve Özellikleri:**
 
-1.  **Stage 2 Talimatlarını Alma:** `scenarioType` kullanılarak `scenarioConfigs` içerisinden ilgili senaryonun `stage2Instructions` talimatı alınır. Eğer belirtilen `scenarioType` bulunamazsa, `"General"` senaryosunun talimatları kullanılır.
+1.  **Stage 2 Talimatlarını Alma:** `scenarioType` kullanılarak `scenarioConfigs` içerisinden ilgili senaryonun `Stage2HistoryInstructions` talimatı alınır. Eğer belirtilen `scenarioType` bulunamazsa, `"General"` senaryosunun talimatları kullanılır.
 2.  **Sohbet Geçmişini Formatlama:** `chatHistory` (en alakalı 5 mesaj) içerisindeki mesajlar, LLM'in anlayabileceği `role` (rol) ve `content` (içerik) formatına dönüştürülür. Mesajın `metadata.sender` alanına göre rol (`"user"` veya `"assistant"`) belirlenir.
 3.  **Mesaj Dizisi Oluşturma:** LLM'e gönderilecek olan mesajlar belirli bir sıra ve rolle yapılandırılır:
-    - **`role: "system"` (1):** Asistanın genel talimatları (`agentPrompt`) ve mevcut senaryonun `stage2Instructions`'ı birleştirilerek verilir. Bu, LLM'e genel davranış çerçevesini ve mevcut görevin özel gereksinimlerini bildirir.
+    - **`role: "system"` (1):** Asistanın genel talimatları (`agentPrompt`) ve mevcut senaryonun `Stage2HistoryInstructions`'ı birleştirilerek verilir. Bu, LLM'e genel davranış çerçevesini ve mevcut görevin özel gereksinimlerini bildirir.
     - **`role: "system"` (2):** Yanıtın maksimum 1000 karakter olması ve doğal bir şekilde sonlanması gerektiğine dair katı bir talimat eklenir.
     - **`role: "memory"`:** `summarizedHistoryText` içeriği bu rolle eklenir. Bu, LLM'e tüm sohbetin genel bir özetini sunar.
     - **Formatlanmış `chatHistory` Mesajları:** Kullanıcı ve asistanın önceki (en alakalı 5) mesajları sırayla eklenir.
