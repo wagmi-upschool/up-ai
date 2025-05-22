@@ -14,6 +14,7 @@ import { GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import fs from "fs";
 import path from "path";
+import { extractSqlLevel } from "../utils/levelExtractor.js";
 const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
 });
@@ -104,18 +105,33 @@ async function createIndices() {
   };
 }
 
-function createAssistantRetriever({ index_assistant_documents, assistantId }) {
+function createAssistantRetriever({
+  index_assistant_documents,
+  assistantId,
+  level,
+}) {
+  const filters = [
+    {
+      key: "assistantId",
+      value: assistantId,
+      operator: "==",
+    },
+  ];
+
+  if (level) {
+    filters.push({
+      key: "level",
+      value: level,
+      operator: "==",
+    });
+    console.log(`Filtering assistant documents by level: ${level}`);
+  }
+
   return new VectorIndexRetriever({
     index: index_assistant_documents,
     includeValues: true,
     filters: {
-      filters: [
-        {
-          key: "assistantId",
-          value: assistantId,
-          operator: "==",
-        },
-      ],
+      filters: filters,
     },
     similarityTopK: 5,
   });
@@ -406,17 +422,90 @@ export async function handleWhatToAskController(req, res) {
     const { index_chat_messages, index_assistant_documents } =
       await createIndices();
 
+    // --- Logic to get chat history (potentially for level extraction and Stage 2 prompt) ---
+    const chatHistoryRetriever = createChatRetriever({
+      index_chat_messages,
+      conversationId,
+    });
+    const retrievedChatMessages = await chatHistoryRetriever.retrieve(query);
+
+    let level = null;
+    let chatHistoryForStage2Prompt = [];
+
+    if (scenarioType === "SQL") {
+      console.log(
+        "SQL Scenario: Attempting to extract level from the relevant user message."
+      );
+      let relevantMessageNode = null;
+      let relevantMessageTextForLevel = "";
+
+      if (retrievedChatMessages && retrievedChatMessages.length > 0) {
+        const userMessages = retrievedChatMessages.filter(
+          (msg) =>
+            msg.node.metadata?.sender === "user" || !msg.node.metadata?.sender
+        );
+
+        // Find the specific message for level extraction
+        for (const msgNode of userMessages) {
+          const messageText = msgNode.node.text || "";
+          let lowerCaseText = messageText.toLowerCase();
+          lowerCaseText = lowerCaseText.replace(/i\u0307/g, "i"); // Normalize for Turkish 'İ'
+          if (lowerCaseText.startsWith("hangi seviyeden başlamak istersin")) {
+            relevantMessageNode = msgNode;
+            relevantMessageTextForLevel = messageText;
+            console.log(
+              "Identified relevant user message for SQL level extraction:",
+              relevantMessageTextForLevel
+            );
+            break; // Found the message, no need to check further
+          }
+        }
+      }
+
+      if (!relevantMessageTextForLevel && query) {
+        relevantMessageTextForLevel = query;
+        console.log(
+          "SQL Scenario: Using current query for level extraction as no specific user message was identified."
+        );
+      }
+
+      level = extractSqlLevel(relevantMessageTextForLevel); // extractSqlLevel already handles normalization
+      console.log(`SQL Scenario - Extracted level: ${level}`);
+      // For Stage 2 history, if we found the specific message, use it. Otherwise, empty or other logic might be needed.
+      // Based on previous logic, it seems we want to use this specific message if found.
+      chatHistoryForStage2Prompt = relevantMessageNode
+        ? [relevantMessageNode]
+        : [];
+    } else {
+      console.log(
+        "Non-SQL Scenario: Level extraction/filtering will not be applied."
+      );
+      // For non-SQL scenarios, use standard filtered chat history for Stage 2 prompt
+      const chatHistoryMinScore = 0.25; // Default score for non-SQL chat history filtering
+      chatHistoryForStage2Prompt = filterByScore(
+        retrievedChatMessages,
+        chatHistoryMinScore
+      );
+      console.log(
+        `Non-SQL Scenario - Filtered chatHistoryForStage2Prompt count: ${chatHistoryForStage2Prompt.length}`
+      );
+    }
+    // --- End: Level extraction and chat history setup for Stage 2 ---
+
     // Stage 1: Retrieve Knowledge & Generate Initial Response
     const retriever_assistant = createAssistantRetriever({
       index_assistant_documents,
       assistantId,
+      level, // Pass the extracted level
     });
     let assistantDocs = await retriever_assistant.retrieve(query);
     console.log(
       "Stage 1: Retrieved assistantDocs count:",
       assistantDocs.length
     );
-    assistantDocs = filterByScore(assistantDocs); // Filter by score
+    // Filter by score based on scenarioType
+    const assistantDocsMinScore = scenarioType === "SQL" ? 0.75 : 0.25;
+    assistantDocs = filterByScore(assistantDocs, assistantDocsMinScore);
     console.log("Stage 1: Filtered assistantDocs count:", assistantDocs.length);
 
     // Pass determined scenarioType to getStage1Prompt
@@ -430,52 +519,43 @@ export async function handleWhatToAskController(req, res) {
     const stage1Response = stage1Completion.text;
     console.log("\n--- Stage 1 Response ---\n", stage1Response);
 
-    // Stage 2: Retrieve History & Refine Response (Streaming)
-    const retriever_chat = createChatRetriever({
-      index_chat_messages,
-      conversationId,
-    });
-    let fullChatHistory = await retriever_chat.retrieve(query);
-    console.log(
-      "\nStage 2: Retrieved chatHistory count:",
-      fullChatHistory.length
-    );
-
-    let chatHistory = filterByScore(fullChatHistory); // Filter by score
-    console.log("Stage 2: Filtered chatHistory count:", chatHistory.length);
+    // Summarize broader chat history (from messages similar to the current query)
+    // `retrievedChatMessages` are already fetched based on current query similarity.
+    const scoredHistoryForSummarization = filterByScore(
+      retrievedChatMessages,
+      0.25
+    ); // Apply standard score filtering for summarization input
 
     let summarizedHistoryText = "";
-    // Summarize chat history if it exceeds 5 messages
+    if (scoredHistoryForSummarization.length > 0) {
+      console.log(
+        `History for summarization has ${scoredHistoryForSummarization.length} messages. Summarizing...`
+      );
 
-    console.log(
-      `Chat history has ${chatHistory.length} messages, exceeding 5. Summarizing...`
-    );
+      const summarizer = getResponseSynthesizer("tree_summarize", {
+        llm: Settings.llm,
+      });
 
-    const summarizer = getResponseSynthesizer(
-      "tree_summarize", // Specify the tree_summarize strategy
-      {
-        llm: Settings.llm, // Use the existing Settings.llm
-        // summaryTemplate: defaultTreeSummarizePrompt, // Optional: to be more explicit, can be added if needed
-      }
-    );
+      const summaryResponse = await summarizer.synthesize({
+        query:
+          "Concisely summarize the key points of the following conversation history. This summary will serve as context for the next turn in the conversation.",
+        nodes: retrievedChatMessages,
+      });
 
-    const summaryResponse = await summarizer.synthesize({
-      query:
-        "Concisely summarize the key points of the following conversation history. This summary will serve as context for the next turn in the conversation.",
-      nodes: fullChatHistory, // chatHistory items are NodeWithScore[]
-    });
-
-    summarizedHistoryText = summaryResponse.response;
-    console.log("Summarized chat history text:", summarizedHistoryText);
+      summarizedHistoryText = summaryResponse.response;
+      console.log("Summarized chat history text:", summarizedHistoryText);
+    } else {
+      console.log("No scorable history found for summarization.");
+    }
 
     // Use getStage2Prompt to construct the message array for the LLM
     const stage2Messages = getStage2Prompt(
       stage1Response,
-      chatHistory, // Pass retrieved history
+      chatHistoryForStage2Prompt, // Use the correctly scoped variable
       query,
       scenarioType,
       agentPrompt,
-      summarizedHistoryText // Pass summarized history text
+      summarizedHistoryText // Pass summarized broader history text
     );
     console.log(
       "\n--- Stage 2 Messages ---\n",
@@ -525,44 +605,28 @@ async function fetchAssistantGroupInfo(assistantId, stage) {
 
   const params = {
     TableName: tableName,
-    // FilterExpression requires attribute type definition if not using DocumentClient's marshalling
     FilterExpression: "contains(relatedAssistants, :assistantIdVal)",
     ExpressionAttributeValues: {
-      // Assuming relatedAssistants is a list of strings (S)
-      // If it's a list of objects like { "S": "id" }, this needs adjustment
-      // DynamoDB ScanCommand requires explicit type descriptors like {"S": assistantId}
-      // The GetCommand uses marshalling implicitly, ScanCommand might not depending on client setup.
-      // Let's assume DocumentClient handles marshalling, otherwise we need { "S": assistantId }
-      // UPDATE: Based on example JSON, relatedAssistants is "L": [{"S": "..."}], so contains might need adjustment or a different approach.
-      // A direct contains check on a list of maps might not work as expected with FilterExpression.
-      // Let's try scanning and filtering in code for robustness, though less efficient.
-      ":assistantIdVal": assistantId, // DocumentClient simplifies this usually. Let's assume it works. Revisit if errors occur.
+      ":assistantIdVal": assistantId,
     },
   };
 
   try {
-    // Using ScanCommand. A full table scan can be inefficient. Consider a GSI if performance is critical.
     const command = new ScanCommand(params);
     const results = await dynamoDbClient.send(command);
 
     if (results.Items && results.Items.length > 0) {
-      // Assuming only one group contains the assistant
       console.log(
         `Found group for assistant ${assistantId}:`,
         results.Items[0].groupTitle
       );
-      // The raw result needs unmarshalling if not using DocumentClient's `scan`
-      // Let's assume standard client requires manual unmarshalling or switching to DocumentClient.
-      // For simplicity now, let's return the first match assuming basic structure access works.
-      // This might need refinement based on the actual client setup and DynamoDB structure handling.
-      return results.Items[0]; // Return the first matching group item
+      return results.Items[0];
     } else {
       console.log(`No group found containing assistantId: ${assistantId}`);
       return null;
     }
   } catch (error) {
     console.error(`Error scanning ${tableName}:`, error);
-    // Rethrow or handle error appropriately
     throw new Error(`Failed to fetch assistant group info: ${error.message}`);
   }
 }
