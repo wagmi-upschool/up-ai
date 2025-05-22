@@ -1,0 +1,40 @@
+{
+    "Table": {
+        "AttributeDefinitions": [
+            {
+                "AttributeName": "id",
+                "AttributeType": "S"
+            }
+        ],
+        "TableName": "UpAssistant-upwagmitec",
+        "KeySchema": [
+            {
+                "AttributeName": "id",
+                "KeyType": "HASH"
+            }
+        ],
+        "TableStatus": "ACTIVE",
+        "CreationDateTime": "2024-08-28T18:29:13.211000+03:00",
+        "ProvisionedThroughput": {
+            "NumberOfDecreasesToday": 0,
+            "ReadCapacityUnits": 5,
+            "WriteCapacityUnits": 5
+        },
+        "TableSizeBytes": 280259,
+        "ItemCount": 19,
+        "TableArn": "arn:aws:dynamodb:us-east-1:399843200753:table/UpAssistant-upwagmitec",
+        "TableId": "ec4db89b-449b-4d37-84d8-a42c32856efb",
+        "StreamSpecification": {
+            "StreamEnabled": true,
+            "StreamViewType": "NEW_IMAGE"
+        },
+        "LatestStreamLabel": "2024-08-28T15:29:13.211",
+        "LatestStreamArn": "arn:aws:dynamodb:us-east-1:399843200753:table/UpAssistant-upwagmitec/stream/2024-08-28T15:29:13.211",
+        "DeletionProtectionEnabled": false,
+        "WarmThroughput": {
+            "ReadUnitsPerSecond": 5,
+            "WriteUnitsPerSecond": 5,
+            "Status": "ACTIVE"
+        }
+    }
+}
