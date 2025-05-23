@@ -4,16 +4,10 @@ import {
   VectorStoreIndex,
   Settings,
   OpenAIEmbedding,
-  getResponseSynthesizer,
-  RetrieverQueryEngine,
-  defaultTreeSummarizePrompt,
   VectorIndexRetriever,
-  defaultRefinePrompt,
 } from "llamaindex";
 import { GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import fs from "fs";
-import path from "path";
 import { extractSqlLevel } from "../utils/levelExtractor.js";
 const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
@@ -274,11 +268,11 @@ If the query is a purely conversational Turkish expression (e.g., "selam", "merh
 // Prompt template for Stage 2: Refine response with chat history
 function getStage2Prompt(
   stage1Response, // Stage 1 LLM response
-  chatHistory, // Retrieved chat history nodes (NodeWithScore[])
+  chatHistory, // Retrieved chat history nodes (NodeWithScore[]) - for specific scenario logic
+  expandedChatHistory, // Expanded chat history with all user messages and filtered assistant messages
   query, // Current user query
   scenarioType, // Determined scenario type
-  agentPrompt, // Initial system/agent instructions
-  summarizedHistoryText // Summarized history text
+  agentPrompt // Initial system/agent instructions
 ) {
   // Fetch stage 2 instructions
   const scenarioConfig =
@@ -286,21 +280,38 @@ function getStage2Prompt(
     scenarioConfigs.find((sc) => sc.id === "General");
   let stage2Instructions = scenarioConfig.Stage2HistoryInstructions;
 
-  // Map chat history to the required format (user/assistant roles)
-  const formattedHistoryMessages = chatHistory
+  // Map expanded chat history to message format for broader context
+  const expandedHistoryMessages = expandedChatHistory
     .map((msg) => {
-      // Infer role based on metadata - adjust field name if necessary
-      // Ensure content exists before creating the message object
-      const content = msg.text || "";
+      const content = msg.node.text || "";
       if (!content) {
         return null; // Skip messages with empty content
       }
       return {
-        role: msg.metadata?.sender === "user" ? "user" : "assistant",
+        role: msg.node.metadata?.role === "user" ? "user" : "assistant",
         content: content,
       };
     })
     .filter((msg) => msg !== null); // Remove null entries
+
+  // For specific scenarios (like SQL), add any additional specific messages that aren't already in expanded history
+  const specificMessages = [];
+  if (scenarioType === "SQL" && chatHistory.length > 0) {
+    // For SQL scenarios, add specific messages that might not be in expanded history
+    const expandedTexts = new Set(
+      expandedChatHistory.map((msg) => msg.node.text)
+    );
+
+    chatHistory.forEach((msg) => {
+      const content = msg.text || "";
+      if (content && !expandedTexts.has(content)) {
+        specificMessages.push({
+          role: msg.metadata?.role === "user" ? "user" : "assistant",
+          content: content,
+        });
+      }
+    });
+  }
 
   // Construct the message array
   const messages = [
@@ -314,8 +325,10 @@ function getStage2Prompt(
         "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n" +
         "Language: MUST always answer in Turkish",
     },
-    { role: "memory", content: summarizedHistoryText },
-    ...formattedHistoryMessages,
+    // Add expanded history messages for broader context
+    ...expandedHistoryMessages,
+    // Add any specific scenario messages that weren't already included
+    ...specificMessages,
     {
       role: "assistant",
       content: stage1Response,
@@ -442,7 +455,7 @@ export async function handleWhatToAskController(req, res) {
       if (retrievedChatMessages && retrievedChatMessages.length > 0) {
         const userMessages = retrievedChatMessages.filter(
           (msg) =>
-            msg.node.metadata?.sender === "user" || !msg.node.metadata?.sender
+            msg.node.metadata?.role === "user" || !msg.node.metadata?.role
         );
 
         // Find the specific message for level extraction
@@ -519,43 +532,39 @@ export async function handleWhatToAskController(req, res) {
     const stage1Response = stage1Completion.text;
     console.log("\n--- Stage 1 Response ---\n", stage1Response);
 
-    // Summarize broader chat history (from messages similar to the current query)
-    // `retrievedChatMessages` are already fetched based on current query similarity.
-    const scoredHistoryForSummarization = filterByScore(
-      retrievedChatMessages,
-      0.25
-    ); // Apply standard score filtering for summarization input
+    // Prepare expanded chat history for Stage 2 (without summarization)
+    // Separate user and assistant messages from retrieved chat messages
+    const userMessages = retrievedChatMessages.filter(
+      (msg) => msg.node.metadata?.role === "user" || !msg.node.metadata?.role
+    );
+    const assistantMessages = retrievedChatMessages.filter(
+      (msg) => msg.node.metadata?.role === "assistant"
+    );
 
-    let summarizedHistoryText = "";
-    if (scoredHistoryForSummarization.length > 0) {
-      console.log(
-        `History for summarization has ${scoredHistoryForSummarization.length} messages. Summarizing...`
-      );
+    // Use all user messages (unfiltered for better context)
+    const allUserMessages = userMessages;
 
-      const summarizer = getResponseSynthesizer("tree_summarize", {
-        llm: Settings.llm,
-      });
+    // Filter assistant messages by score for quality
+    const filteredAssistantMessages = filterByScore(assistantMessages, 0.25);
 
-      const summaryResponse = await summarizer.synthesize({
-        query:
-          "Concisely summarize the key points of the following conversation history. This summary will serve as context for the next turn in the conversation.",
-        nodes: retrievedChatMessages,
-      });
+    // Combine and sort messages by timestamp if available, otherwise maintain retrieval order
+    const expandedChatHistory = [
+      ...allUserMessages,
+      ...filteredAssistantMessages,
+    ];
 
-      summarizedHistoryText = summaryResponse.response;
-      console.log("Summarized chat history text:", summarizedHistoryText);
-    } else {
-      console.log("No scorable history found for summarization.");
-    }
+    console.log(
+      `Expanded chat history: ${allUserMessages.length} user messages, ${filteredAssistantMessages.length} assistant messages`
+    );
 
     // Use getStage2Prompt to construct the message array for the LLM
     const stage2Messages = getStage2Prompt(
       stage1Response,
-      chatHistoryForStage2Prompt, // Use the correctly scoped variable
+      chatHistoryForStage2Prompt, // Use the correctly scoped variable for specific scenario logic
+      expandedChatHistory, // Pass expanded history instead of summarized text
       query,
       scenarioType,
-      agentPrompt,
-      summarizedHistoryText // Pass summarized broader history text
+      agentPrompt
     );
     console.log(
       "\n--- Stage 2 Messages ---\n",
