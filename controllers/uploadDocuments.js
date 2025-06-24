@@ -510,22 +510,139 @@ async function logDocumentsToJSON(documents, type, assistantId) {
 }
 
 /**
+ * Parses CSV content and converts it to Document objects
+ * @param {string} csvText - The CSV content as text
+ * @param {Object} baseMetadata - Base metadata for all documents
+ * @returns {Document[]} - Array of Document objects
+ */
+function parseCSVToDocuments(csvText, baseMetadata) {
+  const lines = csvText.split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length === 0) {
+    console.warn("CSV content is empty");
+    return [];
+  }
+
+  // Parse header row
+  const header = lines[0].split(",").map((col) => col.trim().replace(/"/g, ""));
+  console.log(`CSV headers: ${header.join(", ")}`);
+
+  const documents = [];
+
+  // Process each data row
+  for (let i = 1; i < lines.length; i++) {
+    const row = lines[i];
+    if (!row.trim()) continue;
+
+    // Simple CSV parsing (handles basic cases)
+    const values = parseCSVRow(row);
+
+    if (values.length !== header.length) {
+      console.warn(
+        `Row ${i + 1} has ${values.length} values but expected ${header.length}`
+      );
+      continue;
+    }
+
+    // Create a readable text representation of the row
+    const rowData = {};
+    const textParts = [];
+
+    for (let j = 0; j < header.length; j++) {
+      const key = header[j];
+      const value = values[j] ? values[j].trim().replace(/"/g, "") : "";
+      rowData[key] = value;
+
+      if (value) {
+        textParts.push(`${key}: ${value}`);
+      }
+    }
+
+    // Create meaningful text content
+    const textContent = textParts.join("; ");
+
+    if (textContent.trim()) {
+      const doc = new Document({
+        text: textContent,
+        metadata: {
+          ...baseMetadata,
+          rowNumber: i,
+          csvRowData: rowData,
+          category: determineCategoryFromRow(rowData),
+        },
+      });
+      documents.push(doc);
+    }
+  }
+
+  console.log(`Created ${documents.length} documents from CSV`);
+  return documents;
+}
+
+/**
+ * Simple CSV row parser that handles basic cases
+ * @param {string} row - CSV row string
+ * @returns {string[]} - Array of values
+ */
+function parseCSVRow(row) {
+  const values = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < row.length; i++) {
+    const char = row[i];
+
+    if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === "," && !inQuotes) {
+      values.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+
+  values.push(current); // Add the last value
+  return values;
+}
+
+/**
+ * Determines category/type from CSV row data
+ * @param {Object} rowData - Object containing row data
+ * @returns {string} - Category string
+ */
+function determineCategoryFromRow(rowData) {
+  const itemName = rowData["Kalem_Adı"] || rowData["Kalem Adı"] || "";
+
+  if (itemName.toLowerCase().includes("kredi")) return "kredi";
+  if (itemName.toLowerCase().includes("pos")) return "pos";
+  if (itemName.toLowerCase().includes("transfer")) return "transfer";
+  if (itemName.toLowerCase().includes("çek")) return "çek";
+  if (itemName.toLowerCase().includes("senet")) return "senet";
+  if (itemName.toLowerCase().includes("akreditif")) return "akreditif";
+
+  return "genel";
+}
+
+/**
  * Controller function to add documents to assistant-documents
  */
 export async function handleAddDocumentsToAssistantDocuments(req, res) {
   const { assistantId } = req.params;
-  const { text, url, isHardSkill, hardSkillMetadata } = req.body;
+  const { text, url, isHardSkill, hardSkillMetadata, isCSV } = req.body;
 
   console.log(`Processing request for assistantId: ${assistantId}`);
-  console.log(`Input type: ${url ? "PDF URL" : "text"}`);
+  console.log(`Input type: ${url ? "PDF URL" : isCSV ? "CSV" : "text"}`);
   if (isHardSkill) {
     console.log("Processing as hard skill content");
+  }
+  if (isCSV) {
+    console.log("Processing as CSV content");
   }
 
   try {
     let llamaDocuments = [];
     let logFilePath = null;
-    let documentSourceType = url ? "pdf" : "text";
+    let documentSourceType = url ? "pdf" : isCSV ? "csv" : "text";
 
     const baseMetadata = {
       source: "assistant-documents",
@@ -533,6 +650,7 @@ export async function handleAddDocumentsToAssistantDocuments(req, res) {
       sourceType: documentSourceType,
       timestamp: new Date().toISOString(),
       isHardSkill: isHardSkill || false,
+      isCSV: isCSV || false,
     };
     if (url) {
       baseMetadata.sourceUrl = url;
@@ -565,59 +683,96 @@ export async function handleAddDocumentsToAssistantDocuments(req, res) {
       });
     }
 
-    if (isHardSkill) {
-      console.log("Parsing document into sections for hard skill...");
+    if (isCSV) {
+      console.log("Processing CSV content...");
+      const csvDocuments = parseCSVToDocuments(fullTextContent, baseMetadata);
+      llamaDocuments = csvDocuments;
+
+      if (llamaDocuments.length > 0) {
+        logFilePath = await logDocumentsToJSON(
+          llamaDocuments,
+          "csv",
+          assistantId
+        );
+      }
+    } else if (isHardSkill) {
+      console.log("Processing as hard skill content");
       const parsedSections = parseDocumentIntoSections(fullTextContent);
       console.log(`Document parsed into ${parsedSections.length} sections.`);
-      let globalChunkCounter = 0;
 
-      for (const section of parsedSections) {
-        const chapterNumber = section.inferredChapterNumber;
-        const chapterTitle = `Chapter ${chapterNumber}`;
-
-        let sectionNumberToUse = chapterNumber + ".0"; // Default to .0 if no specific section number
-        let sectionTitleToUse = section.rawSectionHeading; // Use the full raw heading as the section title
-
-        const sectionNumMatch = section.rawSectionHeading.match(
-          /^Section\s+(\d+\.\d+):/i
+      // If no sections found (document doesn't match expected structure), fallback to standard processing
+      if (parsedSections.length === 0) {
+        console.warn(
+          "No sections found in document structure. Falling back to standard chunk processing for hard skill content."
         );
-        if (
-          sectionNumMatch &&
-          sectionNumMatch[1].startsWith(chapterNumber + ".")
-        ) {
-          sectionNumberToUse = sectionNumMatch[1];
-        } else if (
-          section.rawSectionHeading === `${chapterTitle} Overview` &&
-          chapterNumber !== "0"
-        ) {
-          sectionNumberToUse = chapterNumber + ".0";
-        } else if (chapterNumber === "0") {
-          // Preamble
-          sectionNumberToUse = "0.0";
-          sectionTitleToUse = "Preamble/TOC";
-        }
+        const chunks = splitTextIntoChunks(fullTextContent, 512, 102);
+        llamaDocuments = chunks.map(
+          (chunk, index) =>
+            new Document({
+              text: chunk,
+              metadata: {
+                ...baseMetadata,
+                level: "intermediate", // Default level for non-structured hard skill content
+                chapter_number: "1",
+                chapter_title: "Document Content",
+                section_number: "1.0",
+                section_title: "General Content",
+              },
+            })
+        );
+      } else {
+        // Original hard skill processing logic
+        let globalChunkCounter = 0;
 
-        const level = getLevelForChapter(chapterNumber);
-        const sectionContent = section.sectionContent;
-        const chunks = splitTextIntoChunks(sectionContent, 512, 102);
+        for (const section of parsedSections) {
+          const chapterNumber = section.inferredChapterNumber;
+          const chapterTitle = `Chapter ${chapterNumber}`;
 
-        chunks.forEach((chunkText, chunkIndexInSection) => {
-          const docMetadata = {
-            ...baseMetadata, // Common metadata
-            chapter_number: chapterNumber,
-            chapter_title: chapterTitle,
-            section_number: sectionNumberToUse,
-            section_title: sectionTitleToUse,
-            level: level,
-            // chunkIndex: globalChunkCounter, // Overall chunk index
-            // sectionChunkIndex: chunkIndexInSection // Index of chunk within this section
-          };
-          llamaDocuments.push(
-            new Document({ text: chunkText, metadata: docMetadata })
+          let sectionNumberToUse = chapterNumber + ".0"; // Default to .0 if no specific section number
+          let sectionTitleToUse = section.rawSectionHeading; // Use the full raw heading as the section title
+
+          const sectionNumMatch = section.rawSectionHeading.match(
+            /^Section\s+(\d+\.\d+):/i
           );
-          globalChunkCounter++;
-        });
+          if (
+            sectionNumMatch &&
+            sectionNumMatch[1].startsWith(chapterNumber + ".")
+          ) {
+            sectionNumberToUse = sectionNumMatch[1];
+          } else if (
+            section.rawSectionHeading === `${chapterTitle} Overview` &&
+            chapterNumber !== "0"
+          ) {
+            sectionNumberToUse = chapterNumber + ".0";
+          } else if (chapterNumber === "0") {
+            // Preamble
+            sectionNumberToUse = "0.0";
+            sectionTitleToUse = "Preamble/TOC";
+          }
+
+          const level = getLevelForChapter(chapterNumber);
+          const sectionContent = section.sectionContent;
+          const chunks = splitTextIntoChunks(sectionContent, 512, 102);
+
+          chunks.forEach((chunkText, chunkIndexInSection) => {
+            const docMetadata = {
+              ...baseMetadata, // Common metadata
+              chapter_number: chapterNumber,
+              chapter_title: chapterTitle,
+              section_number: sectionNumberToUse,
+              section_title: sectionTitleToUse,
+              level: level,
+              // chunkIndex: globalChunkCounter, // Overall chunk index
+              // sectionChunkIndex: chunkIndexInSection // Index of chunk within this section
+            };
+            llamaDocuments.push(
+              new Document({ text: chunkText, metadata: docMetadata })
+            );
+            globalChunkCounter++;
+          });
+        }
       }
+
       if (llamaDocuments.length > 0) {
         logFilePath = await logDocumentsToJSON(
           llamaDocuments,
