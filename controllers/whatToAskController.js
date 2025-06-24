@@ -6,16 +6,60 @@ import {
   OpenAIEmbedding,
   VectorIndexRetriever,
 } from "llamaindex";
-import { GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { extractSqlLevel } from "../utils/levelExtractor.js";
-const dynamoDbClient = new DynamoDBClient({
-  region: "us-east-1",
-});
+import {
+  GetCommand,
+  ScanCommand,
+  QueryCommand
+} from "@aws-sdk/lib-dynamodb";
+import {
+  DynamoDBClient
+} from "@aws-sdk/client-dynamodb";
+import {
+  LambdaClient,
+  InvokeCommand
+} from "@aws-sdk/client-lambda";
+import {
+  SQSClient,
+  SendMessageCommand
+} from "@aws-sdk/client-sqs";
+import {
+  v4 as uuidv4
+} from "uuid";
+import {
+  extractSqlLevel
+} from "../utils/levelExtractor.js";
 import dotenv from "dotenv";
 
 // Load environment variables from .env file
 dotenv.config();
+
+// Initialize AWS clients
+const dynamoDbClient = new DynamoDBClient({
+  region: "us-east-1",
+});
+
+const lambdaClient = new LambdaClient({
+  region: "us-east-1",
+});
+
+const sqsClient = new SQSClient({
+  region: "us-east-1",
+});
+
+// SQS Queue URLs - Use environment variables from ECS task definition
+const ANALYSIS_QUEUE_URL = process.env.ANALYSIS_QUEUE_URL;
+const PRIORITY_QUEUE_URL = process.env.PRIORITY_QUEUE_URL;
+
+// Validate required environment variables
+if (!ANALYSIS_QUEUE_URL) {
+  console.warn('ANALYSIS_QUEUE_URL environment variable not set');
+}
+if (!PRIORITY_QUEUE_URL) {
+  console.warn('PRIORITY_QUEUE_URL environment variable not set');
+}
+if (!process.env.STAGE) {
+  console.warn('STAGE environment variable not set');
+}
 
 // Function to remove patterns from text
 function replacePatterns(text) {
@@ -43,7 +87,9 @@ function getAzureEmbeddingOptions() {
 
 // Initialize OpenAI settings based on assistant configuration
 async function initializeSettings(config) {
-  const { setEnvs } = await import("@llamaindex/env");
+  const {
+    setEnvs
+  } = await import("@llamaindex/env");
   setEnvs(process.env);
   Settings.llm = new OpenAI({
     azure: {
@@ -104,13 +150,11 @@ function createAssistantRetriever({
   assistantId,
   level,
 }) {
-  const filters = [
-    {
-      key: "assistantId",
-      value: assistantId,
-      operator: "==",
-    },
-  ];
+  const filters = [{
+    key: "assistantId",
+    value: assistantId,
+    operator: "==",
+  }, ];
 
   if (level) {
     filters.push({
@@ -131,18 +175,19 @@ function createAssistantRetriever({
   });
 }
 
-function createChatRetriever({ index_chat_messages, conversationId }) {
+function createChatRetriever({
+  index_chat_messages,
+  conversationId
+}) {
   return new VectorIndexRetriever({
     index: index_chat_messages,
     includeValues: true,
     filters: {
-      filters: [
-        {
-          key: "conversationId",
-          value: conversationId,
-          operator: "==",
-        },
-      ],
+      filters: [{
+        key: "conversationId",
+        value: conversationId,
+        operator: "==",
+      }, ],
     },
     similarityTopK: 5,
   });
@@ -186,15 +231,11 @@ async function loadScenarioConfigs() {
     // If fetch fails, retain potentially stale data but log the error.
     // Only reset to default if scenarioConfigs is empty.
     if (scenarioConfigs.length === 0) {
-      scenarioConfigs = [
-        {
-          id: "General",
-          Stage1DocInstructions:
-            "Provide a clear and contextual response based on the provided information.",
-          Stage2HistoryInstructions:
-            "Refine the prepared response for continuity and clarity. Always answer in Turkish",
-        },
-      ];
+      scenarioConfigs = [{
+        id: "General",
+        Stage1DocInstructions: "Provide a clear and contextual response based on the provided information.",
+        Stage2HistoryInstructions: "Refine the prepared response for continuity and clarity. Always answer in Turkish",
+      }, ];
       console.warn(
         "Using default scenario configurations due to fetch error on initial load."
       );
@@ -210,7 +251,7 @@ async function loadScenarioConfigs() {
 loadScenarioConfigs();
 
 // Prompt template for Stage 1: Retrieve info based on knowledge base
-function getStage1Prompt(retrievedDocs, userQuery, scenarioType) {
+function getStage1Prompt(retrievedDocs, userQuery, scenarioType, personalizationContext) {
   const context = retrievedDocs
     .map((doc) => doc.node.text)
     .join(
@@ -260,7 +301,7 @@ If the query is a purely conversational Turkish expression (e.g., "selam", "merh
   }</context>
   <query>${userQuery}</query>
   <scenario_type>${scenarioType || "General"}</scenario_type>
-  <task>${finalTaskInstructions}</task>
+  <task>${finalTaskInstructions}</task>${personalizationContext || ""}
 </prompt>
 `;
 }
@@ -272,7 +313,8 @@ function getStage2Prompt(
   expandedChatHistory, // Expanded chat history with all user messages and filtered assistant messages
   query, // Current user query
   scenarioType, // Determined scenario type
-  agentPrompt // Initial system/agent instructions
+  agentPrompt, // Initial system/agent instructions
+  personalizationContext // Personalization context
 ) {
   // Fetch stage 2 instructions
   const scenarioConfig =
@@ -288,7 +330,7 @@ function getStage2Prompt(
         return null; // Skip messages with empty content
       }
       return {
-        role: msg.node.metadata?.role === "user" ? "user" : "assistant",
+        role: msg.node.metadata && msg.node.metadata.role === "user" ? "user" : "assistant",
         content: content,
       };
     })
@@ -306,7 +348,7 @@ function getStage2Prompt(
       const content = msg.text || "";
       if (content && !expandedTexts.has(content)) {
         specificMessages.push({
-          role: msg.metadata?.role === "user" ? "user" : "assistant",
+          role: msg.metadata && msg.metadata.role === "user" ? "user" : "assistant",
           content: content,
         });
       }
@@ -314,15 +356,13 @@ function getStage2Prompt(
   }
 
   // Construct the message array
-  const messages = [
-    {
+  const messages = [{
       role: "system",
-      content: `${agentPrompt} ${stage2Instructions}`, // Combine agent prompt and task instructions
+      content: `${agentPrompt} ${stage2Instructions}${personalizationContext || ""}`, // Include personalization context
     },
     {
       role: "system",
-      content:
-        "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n" +
+      content: "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n" +
         "Language: MUST always answer in Turkish",
     },
     // Add expanded history messages for broader context
@@ -340,6 +380,334 @@ function getStage2Prompt(
   ];
 
   return messages; // Return the structured message array
+}
+
+// Fetch user analytics from DynamoDB for personalization
+
+async function fetchUserAnalytics(userId, stage) {
+  const env = stage || process.env.STAGE;
+  const tableName = `analysisResults-${env}`;
+
+  const params = {
+    TableName: tableName,
+    Key: {
+      userId: userId, // Use userId as partition key, not conversationId
+    },
+  };
+
+  try {
+    console.log(`Fetching analytics for userId: ${userId} from table: ${tableName}`);
+    const result = await dynamoDbClient.send(new GetCommand(params));
+
+    if (result.Item) {
+      console.log("User analytics found for personalization");
+      return result.Item;
+    } else {
+      console.log("No analytics data found for this user");
+      return null;
+    }
+  } catch (error) {
+    console.error("Error fetching user analytics:", error);
+    return null;
+  }
+}
+
+// Fetch real-time analysis cache from DynamoDB for immediate personalization
+async function fetchRealtimeAnalysis(conversationId, stage) {
+  const env = stage || process.env.STAGE;
+  const tableName = `realtimeCache-${env}`;
+
+  const params = {
+    TableName: tableName,
+    KeyConditionExpression: 'conversationId = :conversationId',
+    ExpressionAttributeValues: {
+      ':conversationId': conversationId,
+    },
+    ScanIndexForward: false, // Get most recent items first
+    Limit: 10 // Get last 10 analysis entries
+  };
+
+  try {
+    console.log(`Fetching real-time analysis for conversationId: ${conversationId} from table: ${tableName}`);
+    const command = new QueryCommand(params);
+    const result = await dynamoDbClient.send(command);
+
+    if (result.Items && result.Items.length > 0) {
+      console.log(`Found ${result.Items.length} real-time analysis entries, using latest`);
+      return result.Items[0]; // Return the most recent analysis (first item due to ScanIndexForward: false)
+    } else {
+      console.log("No real-time analysis data found for this conversation");
+      return null;
+    }
+  } catch (error) {
+    console.error("Error fetching real-time analysis:", error);
+    return null;
+  }
+}
+
+// Extract real-time personalization context from recent analysis
+function extractRealtimePersonalizationContext(realtimeData) {
+  if (!realtimeData || !realtimeData.analysis) {
+    return null;
+  }
+
+  const analysis = realtimeData.analysis;
+
+  return {
+    // Engagement context
+    engagementLevel: (analysis.engagement && analysis.engagement.level) || 0.5,
+    engagementType: (analysis.engagement && analysis.engagement.type) || "neutral",
+    engagementIndicators: (analysis.engagement && analysis.engagement.indicators) || [],
+
+    // Sentiment and emotional state
+    currentSentiment: (analysis.sentiment && analysis.sentiment.sentiment) || "neutral",
+    sentimentIntensity: (analysis.sentiment && analysis.sentiment.intensity) || 0.5,
+    sentimentConfidence: (analysis.sentiment && analysis.sentiment.confidence) || 0.5,
+    currentEmotions: (analysis.sentiment && analysis.sentiment.emotions) || [],
+
+    // Understanding and comprehension
+    understandingLevel: (analysis.understanding && analysis.understanding.understanding_level) || "moderate",
+    understandingConfidence: (analysis.understanding && analysis.understanding.confidence) || 0.5,
+    needsClarification: (analysis.understanding && analysis.understanding.needs_clarification) || [],
+    misconceptions: (analysis.understanding && analysis.understanding.misconceptions) || [],
+
+    // Error patterns and suggestions
+    hasErrors: (analysis.errors && analysis.errors.detected) || false,
+    errorSeverity: (analysis.errors && analysis.errors.severity) || "low",
+    errorSuggestions: (analysis.errors && analysis.errors.suggestions) || [],
+
+    // Triggers and concerns
+    triggers: analysis.triggers || [],
+
+    // Timestamp for context
+    analysisTimestamp: analysis.timestamp,
+    messageId: analysis.messageId
+  };
+}
+
+// Create real-time personalization prompt addition
+function createRealtimePersonalizationPrompt(realtimeData) {
+  if (!realtimeData) {
+    return "";
+  }
+
+  let realtimePrompt = "\n<realtime_context>\n";
+
+  // Current engagement state
+  realtimePrompt += "<current_engagement>\n";
+  realtimePrompt += `- Engagement level: ${realtimeData.engagementLevel} (${realtimeData.engagementType})\n`;
+  if (realtimeData.engagementIndicators.length > 0) {
+    realtimePrompt += `- Engagement indicators: ${realtimeData.engagementIndicators.join(', ')}\n`;
+  }
+  realtimePrompt += "</current_engagement>\n";
+
+  // Current emotional/sentiment state
+  realtimePrompt += "<current_sentiment>\n";
+  realtimePrompt += `- Sentiment: ${realtimeData.currentSentiment} (intensity: ${realtimeData.sentimentIntensity})\n`;
+  if (realtimeData.currentEmotions.length > 0) {
+    realtimePrompt += `- Current emotions: ${realtimeData.currentEmotions.join(', ')}\n`;
+  }
+  realtimePrompt += "</current_sentiment>\n";
+
+  // Understanding assessment
+  realtimePrompt += "<understanding_assessment>\n";
+  realtimePrompt += `- Understanding level: ${realtimeData.understandingLevel}\n`;
+  realtimePrompt += `- Confidence in understanding: ${realtimeData.understandingConfidence}\n`;
+  if (realtimeData.needsClarification.length > 0) {
+    realtimePrompt += `- Needs clarification: ${realtimeData.needsClarification.join('; ')}\n`;
+  }
+  if (realtimeData.misconceptions.length > 0) {
+    realtimePrompt += `- Misconceptions detected: ${realtimeData.misconceptions.join('; ')}\n`;
+  }
+  realtimePrompt += "</understanding_assessment>\n";
+
+  // Error handling context
+  if (realtimeData.hasErrors) {
+    realtimePrompt += "<error_context>\n";
+    realtimePrompt += `- Errors detected: ${realtimeData.hasErrors}\n`;
+    realtimePrompt += `- Error severity: ${realtimeData.errorSeverity}\n`;
+    if (realtimeData.errorSuggestions.length > 0) {
+      realtimePrompt += `- Suggestions: ${realtimeData.errorSuggestions.join('; ')}\n`;
+    }
+    realtimePrompt += "</error_context>\n";
+  }
+
+  // Triggers and concerns
+  if (realtimeData.triggers.length > 0) {
+    realtimePrompt += "<current_triggers>\n";
+    realtimeData.triggers.forEach(trigger => {
+      realtimePrompt += `- ${trigger.type} (${trigger.severity}): ${JSON.stringify(trigger.data)}\n`;
+    });
+    realtimePrompt += "</current_triggers>\n";
+  }
+
+  // Response adaptation guidelines
+  realtimePrompt += "<adaptation_guidelines>\n";
+
+  // Engagement-based adaptations
+  if (realtimeData.engagementLevel < 0.3) {
+    realtimePrompt += "- LOW ENGAGEMENT DETECTED: Use more engaging, interactive approaches. Ask direct questions. Use simpler language.\n";
+  } else if (realtimeData.engagementLevel > 0.7) {
+    realtimePrompt += "- HIGH ENGAGEMENT: User is actively engaged. Can use more complex concepts and deeper discussions.\n";
+  }
+
+  // Understanding-based adaptations
+  if (realtimeData.understandingLevel === "none" || realtimeData.understandingLevel === "low") {
+    realtimePrompt += "- LOW UNDERSTANDING: Simplify explanations. Use more examples. Check comprehension frequently.\n";
+  }
+
+  // Sentiment-based adaptations
+  if (realtimeData.currentSentiment === "negative") {
+    realtimePrompt += "- NEGATIVE SENTIMENT: Be more supportive and encouraging. Address concerns directly.\n";
+  } else if (realtimeData.currentSentiment === "positive") {
+    realtimePrompt += "- POSITIVE SENTIMENT: Build on positive momentum. Can introduce new challenges.\n";
+  }
+
+  realtimePrompt += "</adaptation_guidelines>\n";
+  realtimePrompt += "</realtime_context>\n";
+
+  return realtimePrompt;
+}
+
+// Extract relevant personalization insights from analytics data
+function extractPersonalizationContext(analyticsData) {
+  if (!analyticsData || !analyticsData.analysis) {
+    return null;
+  }
+
+  const analysis = analyticsData.analysis;
+
+  // Extract key personalization fields
+  const personalization = {
+    // Communication preferences
+    communicationGuidelines: (analysis.personalizationInsights && analysis.personalizationInsights.communicationGuidelines) || {},
+    personalizedGreeting: (analysis.personalizationInsights && analysis.personalizationInsights.personalizedGreeting) || "",
+
+    // Content and learning preferences
+    contentRecommendations: (analysis.personalizationInsights && analysis.personalizationInsights.contentRecommendations) || {},
+    learningStyle: (analysis.learningPatterns && analysis.learningPatterns.learningStyle && analysis.learningPatterns.learningStyle.primary) || "mixed",
+    preferredInteractionStyle: (analysis.learningPatterns && analysis.learningPatterns.engagementPatterns && analysis.learningPatterns.engagementPatterns.preferredInteractionStyle) || "collaborative",
+    explanationPreferences: (analysis.learningPatterns && analysis.learningPatterns.explanationPreferences) || [],
+
+    // Emotional and engagement context
+    overallMood: (analysis.emotionalState && analysis.emotionalState.overallMood) || "neutral",
+    confidenceLevel: (analysis.skillAssessment && analysis.skillAssessment.confidence) || 0.5,
+    currentSkillLevel: (analysis.skillAssessment && analysis.skillAssessment.currentLevel) || "intermediate",
+    engagementLevel: (analysis.emotionalState && analysis.emotionalState.engagementLevel && analysis.emotionalState.engagementLevel.overall) || 0.5,
+
+    // Topic interests and preferences
+    highInterestTopics: (analysis.topicAnalysis && analysis.topicAnalysis.interestIndicators && analysis.topicAnalysis.interestIndicators.highInterestTopics) || [],
+    lowInterestTopics: (analysis.topicAnalysis && analysis.topicAnalysis.interestIndicators && analysis.topicAnalysis.interestIndicators.lowInterestTopics) || [],
+    strugglingConcepts: (analysis.skillAssessment && analysis.skillAssessment.strugglingConcepts) || [],
+    masteredConcepts: (analysis.skillAssessment && analysis.skillAssessment.masteredConcepts) || [],
+
+    // Session suggestions
+    nextSessionSuggestions: (analysis.personalizationInsights && analysis.personalizationInsights.nextSessionSuggestions) || {},
+    learningGoals: (analysis.personalizationInsights && analysis.personalizationInsights.learningGoals) || {},
+
+    // Additional context
+    attentionSpan: (analysis.learningPatterns && analysis.learningPatterns.attentionSpan && analysis.learningPatterns.attentionSpan.estimatedMinutes) || 10,
+    pacingPreference: (analysis.learningPatterns && analysis.learningPatterns.pacingPreference) || "moderate",
+    motivationalTriggers: (analysis.learningPatterns && analysis.learningPatterns.motivationalTriggers) || []
+  };
+
+  return personalization;
+}
+
+// Create personalization context string for prompts
+function createPersonalizationPrompt(personalizationData) {
+  if (!personalizationData) {
+    return "";
+  }
+
+  let personalizationPrompt = "\n<personalization_context>\n";
+
+  // Communication style guidelines
+  if (personalizationData.communicationGuidelines && Object.keys(personalizationData.communicationGuidelines).length > 0) {
+    const guidelines = personalizationData.communicationGuidelines;
+    personalizationPrompt += "<communication_style>\n";
+    if (guidelines.tone) personalizationPrompt += `- Tone: ${guidelines.tone}\n`;
+    if (guidelines.complexity) personalizationPrompt += `- Language complexity: ${guidelines.complexity}\n`;
+    if (guidelines.responseLength) personalizationPrompt += `- Preferred response length: ${guidelines.responseLength}\n`;
+    if (guidelines.encouragementLevel) personalizationPrompt += `- Encouragement level: ${guidelines.encouragementLevel}\n`;
+    if (guidelines.useAnalogies) personalizationPrompt += `- Use analogies: ${guidelines.useAnalogies ? 'yes' : 'no'}\n`;
+    if (guidelines.useHumor) personalizationPrompt += `- Use humor: ${guidelines.useHumor ? 'yes' : 'no'}\n`;
+    personalizationPrompt += "</communication_style>\n";
+  }
+
+  // Learning preferences
+  personalizationPrompt += "<learning_preferences>\n";
+  if (personalizationData.learningStyle) personalizationPrompt += `- Learning style: ${personalizationData.learningStyle}\n`;
+  if (personalizationData.preferredInteractionStyle) personalizationPrompt += `- Interaction style: ${personalizationData.preferredInteractionStyle}\n`;
+  if (personalizationData.explanationPreferences.length > 0) {
+    personalizationPrompt += `- Explanation preferences: ${personalizationData.explanationPreferences.join(', ')}\n`;
+  }
+  if (personalizationData.pacingPreference) personalizationPrompt += `- Pacing preference: ${personalizationData.pacingPreference}\n`;
+  personalizationPrompt += "</learning_preferences>\n";
+
+  // Current state and context
+  personalizationPrompt += "<user_context>\n";
+  if (personalizationData.overallMood) personalizationPrompt += `- Current mood: ${personalizationData.overallMood}\n`;
+  if (personalizationData.currentSkillLevel) personalizationPrompt += `- Skill level: ${personalizationData.currentSkillLevel}\n`;
+  if (personalizationData.confidenceLevel) personalizationPrompt += `- Confidence level: ${personalizationData.confidenceLevel}\n`;
+  if (personalizationData.engagementLevel) personalizationPrompt += `- Engagement level: ${personalizationData.engagementLevel}\n`;
+  if (personalizationData.attentionSpan) personalizationPrompt += `- Estimated attention span: ${personalizationData.attentionSpan} minutes\n`;
+  personalizationPrompt += "</user_context>\n";
+
+  // Topic interests
+  if (personalizationData.highInterestTopics.length > 0 || personalizationData.lowInterestTopics.length > 0) {
+    personalizationPrompt += "<topic_preferences>\n";
+    if (personalizationData.highInterestTopics.length > 0) {
+      personalizationPrompt += `- High interest topics: ${personalizationData.highInterestTopics.join(', ')}\n`;
+    }
+    if (personalizationData.lowInterestTopics.length > 0) {
+      personalizationPrompt += `- Low interest topics: ${personalizationData.lowInterestTopics.join(', ')}\n`;
+    }
+    personalizationPrompt += "</topic_preferences>\n";
+  }
+
+  // Learning progress
+  if (personalizationData.masteredConcepts.length > 0 || personalizationData.strugglingConcepts.length > 0) {
+    personalizationPrompt += "<learning_progress>\n";
+    if (personalizationData.masteredConcepts.length > 0) {
+      personalizationPrompt += `- Mastered concepts: ${personalizationData.masteredConcepts.join(', ')}\n`;
+    }
+    if (personalizationData.strugglingConcepts.length > 0) {
+      personalizationPrompt += `- Struggling with: ${personalizationData.strugglingConcepts.join(', ')}\n`;
+    }
+    personalizationPrompt += "</learning_progress>\n";
+  }
+
+  // Content recommendations
+  if (personalizationData.contentRecommendations && Object.keys(personalizationData.contentRecommendations).length > 0) {
+    const content = personalizationData.contentRecommendations;
+    personalizationPrompt += "<content_guidance>\n";
+    if (content.emphasizeTopics && content.emphasizeTopics.length > 0) {
+      personalizationPrompt += `- Emphasize topics: ${content.emphasizeTopics.join(', ')}\n`;
+    }
+    if (content.avoidTopics && content.avoidTopics.length > 0) {
+      personalizationPrompt += `- Avoid topics: ${content.avoidTopics.join(', ')}\n`;
+    }
+    if (content.difficulty) personalizationPrompt += `- Preferred difficulty: ${content.difficulty}\n`;
+    if (content.format && content.format.length > 0) {
+      personalizationPrompt += `- Preferred formats: ${content.format.join(', ')}\n`;
+    }
+    personalizationPrompt += "</content_guidance>\n";
+  }
+
+  // Motivational context
+  if (personalizationData.motivationalTriggers.length > 0) {
+    personalizationPrompt += `<motivational_triggers>\n- ${personalizationData.motivationalTriggers.join(', ')}\n</motivational_triggers>\n`;
+  }
+
+  // Personalized greeting for context
+  if (personalizationData.personalizedGreeting) {
+    personalizationPrompt += `<personalized_greeting_example>\n${personalizationData.personalizedGreeting}\n</personalized_greeting_example>\n`;
+  }
+
+  personalizationPrompt += "</personalization_context>\n";
+
+  return personalizationPrompt;
 }
 
 // Function to map group title to scenario type
@@ -373,13 +741,42 @@ function mapGroupToScenarioType(groupInfo) {
 
 // Controller to handle streaming reflection requests
 export async function handleWhatToAskController(req, res) {
-  const { userId, conversationId } = req.params;
+  const {
+    userId,
+    conversationId
+  } = req.params;
   console.log("conversationId:", conversationId);
-  const { query, assistantId, type, stage } = req.body;
+  console.log("userId:", userId);
+  const {
+    query,
+    assistantId,
+    type,
+    stage
+  } = req.body;
+
+  let fullOutput = ''; // Track the complete response for analysis
 
   try {
     // Ensure latest scenario configs are loaded (respecting cache duration)
     await loadScenarioConfigs();
+
+    // Fetch user analytics for personalization - use userId instead of conversationId
+    console.log("Fetching user analytics for personalization...");
+    const analyticsData = await fetchUserAnalytics(userId, stage);
+    const personalizationData = extractPersonalizationContext(analyticsData);
+    const personalizationPrompt = createPersonalizationPrompt(personalizationData);
+
+    // Fetch real-time analysis for immediate personalization - use conversationId
+    console.log("Fetching real-time analysis for immediate personalization...");
+    const realtimeAnalysisData = await fetchRealtimeAnalysis(conversationId, stage);
+    const realtimePersonalizationData = extractRealtimePersonalizationContext(realtimeAnalysisData);
+    const realtimePersonalizationPrompt = createRealtimePersonalizationPrompt(realtimePersonalizationData);
+
+    // Combine both personalization contexts
+    const combinedPersonalizationPrompt = personalizationPrompt + realtimePersonalizationPrompt;
+
+    console.log("Personalization context prepared:", personalizationData ? "Yes" : "No");
+    console.log("Real-time personalization context prepared:", realtimePersonalizationData ? "Yes" : "No");
 
     const systemMessage = await fetchAssistantConfig(assistantId, stage);
     if (!systemMessage || !systemMessage.prompt)
@@ -432,8 +829,11 @@ export async function handleWhatToAskController(req, res) {
     await initializeSettings(assistantConfig);
 
     // Create indices for both chat messages and assistant documents
-    const { index_chat_messages, index_assistant_documents } =
-      await createIndices();
+    const {
+      index_chat_messages,
+      index_assistant_documents
+    } =
+    await createIndices();
 
     // --- Logic to get chat history (potentially for level extraction and Stage 2 prompt) ---
     const chatHistoryRetriever = createChatRetriever({
@@ -455,7 +855,7 @@ export async function handleWhatToAskController(req, res) {
       if (retrievedChatMessages && retrievedChatMessages.length > 0) {
         const userMessages = retrievedChatMessages.filter(
           (msg) =>
-            msg.node.metadata?.role === "user" || !msg.node.metadata?.role
+          msg.node.metadata && msg.node.metadata.role === "user" || !msg.node.metadata || !msg.node.metadata.role
         );
 
         // Find the specific message for level extraction
@@ -486,9 +886,7 @@ export async function handleWhatToAskController(req, res) {
       console.log(`SQL Scenario - Extracted level: ${level}`);
       // For Stage 2 history, if we found the specific message, use it. Otherwise, empty or other logic might be needed.
       // Based on previous logic, it seems we want to use this specific message if found.
-      chatHistoryForStage2Prompt = relevantMessageNode
-        ? [relevantMessageNode]
-        : [];
+      chatHistoryForStage2Prompt = relevantMessageNode ? [relevantMessageNode] : [];
     } else {
       console.log(
         "Non-SQL Scenario: Level extraction/filtering will not be applied."
@@ -521,8 +919,8 @@ export async function handleWhatToAskController(req, res) {
     assistantDocs = filterByScore(assistantDocs, assistantDocsMinScore);
     console.log("Stage 1: Filtered assistantDocs count:", assistantDocs.length);
 
-    // Pass determined scenarioType to getStage1Prompt
-    const stage1Prompt = getStage1Prompt(assistantDocs, query, scenarioType);
+    // Pass determined scenarioType to getStage1Prompt with personalization context
+    const stage1Prompt = getStage1Prompt(assistantDocs, query, scenarioType, combinedPersonalizationPrompt);
     console.log("\n--- Stage 1 Prompt ---\n", stage1Prompt);
 
     // Use Settings.llm directly for the first non-streaming call
@@ -535,10 +933,10 @@ export async function handleWhatToAskController(req, res) {
     // Prepare expanded chat history for Stage 2 (without summarization)
     // Separate user and assistant messages from retrieved chat messages
     const userMessages = retrievedChatMessages.filter(
-      (msg) => msg.node.metadata?.role === "user" || !msg.node.metadata?.role
+      (msg) => msg.node.metadata && msg.node.metadata.role === "user" || !msg.node.metadata || !msg.node.metadata.role
     );
     const assistantMessages = retrievedChatMessages.filter(
-      (msg) => msg.node.metadata?.role === "assistant"
+      (msg) => msg.node.metadata && msg.node.metadata.role === "assistant"
     );
 
     // Use all user messages (unfiltered for better context)
@@ -557,14 +955,15 @@ export async function handleWhatToAskController(req, res) {
       `Expanded chat history: ${allUserMessages.length} user messages, ${filteredAssistantMessages.length} assistant messages`
     );
 
-    // Use getStage2Prompt to construct the message array for the LLM
+    // Use getStage2Prompt to construct the message array for the LLM with personalization
     const stage2Messages = getStage2Prompt(
       stage1Response,
       chatHistoryForStage2Prompt, // Use the correctly scoped variable for specific scenario logic
       expandedChatHistory, // Pass expanded history instead of summarized text
       query,
       scenarioType,
-      agentPrompt
+      agentPrompt,
+      combinedPersonalizationPrompt // Pass personalization context
     );
     console.log(
       "\n--- Stage 2 Messages ---\n",
@@ -582,20 +981,47 @@ export async function handleWhatToAskController(req, res) {
     res.setHeader("Transfer-Encoding", "chunked");
 
     for await (const chunk of finalResultStream) {
-      res.write(chunk.delta); // Use delta for chat streaming
+      const content = chunk.delta;
+      fullOutput += content; // Collect the full output
+      res.write(content); // Use delta for chat streaming
     }
     res.write("[DONE-UP]");
     res.end();
+
+    // 🔥 POST-STREAM: SQS + Real-time Analysis
+    console.log("Starting post-stream analysis...");
+
+    // Get chat history count for analysis triggers
+    const chatHistoryCount = await getChatHistoryCount(conversationId);
+
+    // Create mock chat history array for analysis (similar to Lambda structure)
+    const mockChatHistory = Array(chatHistoryCount).fill({
+      role: 'user',
+      content: 'message'
+    });
+
+    await Promise.all([
+      triggerRealtimeAnalysis(req.body, conversationId, userId, mockChatHistory, fullOutput),
+      sendToAnalysisQueues(req.body, conversationId, userId, mockChatHistory)
+    ]);
+
+    console.log("Post-stream analysis completed successfully");
+
   } catch (err) {
     console.error("Error in handleWhatToAskController:", err);
-    // Avoid sending detailed error messages in production
-    res.status(500).json({ error: "An internal server error occurred." });
+
+    // If streaming hasn't started, send error response
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: "An internal server error occurred."
+      });
+    }
   }
 }
 
 // Fetch assistant configuration from DynamoDB
 async function fetchAssistantConfig(assistantId, stage) {
-  const env = stage ?? process.env.STAGE;
+  const env = stage || process.env.STAGE;
   const params = {
     TableName: `UpAssistant-${env}`,
     Key: {
@@ -608,7 +1034,7 @@ async function fetchAssistantConfig(assistantId, stage) {
 
 // Fetch assistant group info by scanning the AssistantGroup table
 async function fetchAssistantGroupInfo(assistantId, stage) {
-  const env = stage ?? process.env.STAGE;
+  const env = stage || process.env.STAGE;
   const tableName = `AssistantGroup-${env}`; // Adjust if table name format is different
   console.log(`Scanning table ${tableName} for assistantId: ${assistantId}`);
 
@@ -637,5 +1063,237 @@ async function fetchAssistantGroupInfo(assistantId, stage) {
   } catch (error) {
     console.error(`Error scanning ${tableName}:`, error);
     throw new Error(`Failed to fetch assistant group info: ${error.message}`);
+  }
+}
+
+// 🔥 REAL-TIME ANALYSIS (Direct Lambda call for speed)
+async function triggerRealtimeAnalysis(requestBody, conversationId, userId, chatHistory, fullOutput) {
+  const realtimePayload = {
+    message: {
+      id: uuidv4(),
+      content: requestBody.query,
+      role: 'user',
+      timestamp: new Date().toISOString()
+    },
+    conversationContext: {
+      conversationId: conversationId,
+      lastAssistantMessage: fullOutput,
+      messageCount: chatHistory.length + 1,
+      assistantId: requestBody.assistantId
+    },
+    userId: userId,
+    assistantId: requestBody.assistantId
+  };
+
+  try {
+    const command = new InvokeCommand({
+      FunctionName: `realtimeMessageAnalysis-${process.env.STAGE}`,
+      InvocationType: 'Event',
+      Payload: JSON.stringify({
+        body: JSON.stringify(realtimePayload)
+      })
+    });
+
+    await lambdaClient.send(command);
+    console.log('Real-time analysis triggered successfully');
+  } catch (error) {
+    console.error('Real-time analysis failed:', error);
+    // Don't fail main flow for analysis errors
+  }
+}
+
+// 🔥 SQS QUEUE INTEGRATION
+async function sendToAnalysisQueues(requestBody, conversationId, userId, chatHistory) {
+  const messageCount = chatHistory.length + 1;
+  const timestamp = new Date().toISOString();
+  const analysisRequests = [];
+
+  // Periodic analysis (every 10 messages)
+  if (messageCount % 10 === 0) {
+    analysisRequests.push({
+      queue: ANALYSIS_QUEUE_URL,
+      priority: 'medium',
+      message: {
+        conversationId: conversationId,
+        userId: userId,
+        triggerType: 'periodic_analysis',
+        messageCount: messageCount,
+        metadata: {
+          reason: `Periodic analysis at ${messageCount} messages`,
+          timestamp: timestamp
+        }
+      }
+    });
+  }
+
+  // Initial analysis (3rd message) - HIGH PRIORITY
+  if (messageCount === 3) {
+    analysisRequests.push({
+      queue: PRIORITY_QUEUE_URL,
+      priority: 'high',
+      message: {
+        conversationId: conversationId,
+        userId: userId,
+        triggerType: 'initial_analysis',
+        messageCount: messageCount,
+        metadata: {
+          reason: 'Initial conversation analysis for personalization',
+          timestamp: timestamp,
+          urgency: 'immediate_personalization'
+        }
+      }
+    });
+  }
+
+  // Milestone analysis (25, 50, 100 messages)
+  if ([25, 50, 100].includes(messageCount)) {
+    analysisRequests.push({
+      queue: ANALYSIS_QUEUE_URL,
+      priority: 'medium',
+      message: {
+        conversationId: conversationId,
+        userId: userId,
+        triggerType: 'milestone_analysis',
+        messageCount: messageCount,
+        metadata: {
+          reason: `Milestone analysis at ${messageCount} messages`,
+          timestamp: timestamp,
+          milestone: messageCount
+        }
+      }
+    });
+  }
+
+  // Time-based analysis (30+ minutes)
+  try {
+    const conversationStart = await getConversationStartTime(conversationId);
+    const duration = Date.now() - conversationStart;
+
+    if (duration > 30 * 60 * 1000 && messageCount % 10 !== 0) { // Don't duplicate with periodic
+      analysisRequests.push({
+        queue: ANALYSIS_QUEUE_URL,
+        priority: 'medium',
+        message: {
+          conversationId: conversationId,
+          userId: userId,
+          triggerType: 'time_based_analysis',
+          messageCount: messageCount,
+          metadata: {
+            reason: 'Long conversation duration analysis',
+            timestamp: timestamp,
+            duration: duration
+          }
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Error checking conversation duration:', error);
+  }
+
+  // Send to SQS queues
+  if (analysisRequests.length > 0) {
+    const sqsPromises = analysisRequests.map(request => sendToSQS(request));
+    await Promise.all(sqsPromises);
+    console.log(`Sent ${analysisRequests.length} analysis requests to SQS`);
+  }
+}
+
+// 🔥 SQS SEND FUNCTION
+async function sendToSQS({
+  queue,
+  priority,
+  message
+}) {
+  try {
+    const messageAttributes = {
+      userId: {
+        DataType: 'String',
+        StringValue: message.userId
+      },
+      priority: {
+        DataType: 'String',
+        StringValue: priority
+      },
+      conversationId: {
+        DataType: 'String',
+        StringValue: message.conversationId
+      },
+      triggerType: {
+        DataType: 'String',
+        StringValue: message.triggerType
+      }
+    };
+
+    const sqsParams = {
+      QueueUrl: queue,
+      MessageBody: JSON.stringify(message),
+      MessageAttributes: messageAttributes
+    };
+
+    // Add FIFO-specific parameters for priority queue
+    if (queue === PRIORITY_QUEUE_URL) {
+      sqsParams.MessageGroupId = message.conversationId;
+      sqsParams.MessageDeduplicationId = `${message.conversationId}-${message.messageCount}-${message.triggerType}-${Date.now()}`;
+    }
+
+    const command = new SendMessageCommand(sqsParams);
+    await sqsClient.send(command);
+    console.log(`Sent ${message.triggerType} to ${priority} priority queue`);
+
+  } catch (error) {
+    console.error(`Error sending to SQS (${priority}):`, error);
+    // Don't fail main flow for SQS errors
+  }
+}
+
+// Helper function - get conversation start time
+async function getConversationStartTime(conversationId) {
+  if (!conversationId) return Date.now();
+
+  const env = process.env.STAGE;
+  const params = {
+    TableName: `UpConversationMessage-${env}`,
+    KeyConditionExpression: 'conversationId = :conversationId',
+    ScanIndexForward: true,
+    Limit: 1,
+    ExpressionAttributeValues: {
+      ':conversationId': conversationId
+    }
+  };
+
+  try {
+    const command = new QueryCommand(params);
+    const result = await dynamoDbClient.send(command);
+    if (result.Items && result.Items.length > 0) {
+      return new Date(result.Items[0].createdAt).getTime();
+    }
+    return Date.now();
+  } catch (error) {
+    console.error('Error getting conversation start time:', error);
+    return Date.now();
+  }
+}
+
+// Helper function to get chat history count
+async function getChatHistoryCount(conversationId) {
+  if (!conversationId) return 0;
+
+  const env = process.env.STAGE;
+  const params = {
+    TableName: `UpConversationMessage-${env}`,
+    KeyConditionExpression: 'conversationId = :conversationId',
+    Select: 'COUNT',
+    ExpressionAttributeValues: {
+      ':conversationId': conversationId
+    }
+  };
+
+  try {
+    const command = new QueryCommand(params);
+    const result = await dynamoDbClient.send(command);
+    return result.Count || 0;
+  } catch (error) {
+    console.error('Error getting chat history count:', error);
+    return 0;
   }
 }
