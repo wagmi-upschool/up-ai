@@ -6,28 +6,13 @@ import {
   OpenAIEmbedding,
   VectorIndexRetriever,
 } from "llamaindex";
-import {
-  GetCommand,
-  ScanCommand,
-  QueryCommand
-} from "@aws-sdk/lib-dynamodb";
-import {
-  DynamoDBClient
-} from "@aws-sdk/client-dynamodb";
-import {
-  LambdaClient,
-  InvokeCommand
-} from "@aws-sdk/client-lambda";
-import {
-  SQSClient,
-  SendMessageCommand
-} from "@aws-sdk/client-sqs";
-import {
-  v4 as uuidv4
-} from "uuid";
-import {
-  extractSqlLevel
-} from "../utils/levelExtractor.js";
+import { GetCommand, ScanCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
+import { v4 as uuidv4 } from "uuid";
+import { extractSqlLevel } from "../utils/levelExtractor.js";
+import { ConversationMemoryService } from "../services/conversationMemoryService.js";
 import dotenv from "dotenv";
 
 // Load environment variables from .env file
@@ -52,13 +37,13 @@ const PRIORITY_QUEUE_URL = process.env.PRIORITY_QUEUE_URL;
 
 // Validate required environment variables
 if (!ANALYSIS_QUEUE_URL) {
-  console.warn('ANALYSIS_QUEUE_URL environment variable not set');
+  console.warn("ANALYSIS_QUEUE_URL environment variable not set");
 }
 if (!PRIORITY_QUEUE_URL) {
-  console.warn('PRIORITY_QUEUE_URL environment variable not set');
+  console.warn("PRIORITY_QUEUE_URL environment variable not set");
 }
 if (!process.env.STAGE) {
-  console.warn('STAGE environment variable not set');
+  console.warn("STAGE environment variable not set");
 }
 
 // Function to remove patterns from text
@@ -87,9 +72,7 @@ function getAzureEmbeddingOptions() {
 
 // Initialize OpenAI settings based on assistant configuration
 async function initializeSettings(config) {
-  const {
-    setEnvs
-  } = await import("@llamaindex/env");
+  const { setEnvs } = await import("@llamaindex/env");
   setEnvs(process.env);
   Settings.llm = new OpenAI({
     azure: {
@@ -150,11 +133,13 @@ function createAssistantRetriever({
   assistantId,
   level,
 }) {
-  const filters = [{
-    key: "assistantId",
-    value: assistantId,
-    operator: "==",
-  }, ];
+  const filters = [
+    {
+      key: "assistantId",
+      value: assistantId,
+      operator: "==",
+    },
+  ];
 
   if (level) {
     filters.push({
@@ -171,23 +156,22 @@ function createAssistantRetriever({
     filters: {
       filters: filters,
     },
-    similarityTopK: 5,
+    similarityTopK: 8, // Increased from 5 to get more relevant context
   });
 }
 
-function createChatRetriever({
-  index_chat_messages,
-  conversationId
-}) {
+function createChatRetriever({ index_chat_messages, conversationId }) {
   return new VectorIndexRetriever({
     index: index_chat_messages,
     includeValues: true,
     filters: {
-      filters: [{
-        key: "conversationId",
-        value: conversationId,
-        operator: "==",
-      }, ],
+      filters: [
+        {
+          key: "conversationId",
+          value: conversationId,
+          operator: "==",
+        },
+      ],
     },
     similarityTopK: 5,
   });
@@ -195,6 +179,29 @@ function createChatRetriever({
 
 function filterByScore(results, minScore = 0.25) {
   return results.filter((result) => (result.score || 0) > minScore);
+}
+
+// Enhanced query function that includes conversation context
+function createContextAwareQuery(userQuery, conversationContext) {
+  if (!conversationContext || !conversationContext.context) {
+    return userQuery;
+  }
+
+  const { currentTopic, userProfile } = conversationContext.context;
+
+  // If we have a current topic, enhance the query with topic context
+  if (
+    currentTopic &&
+    currentTopic.topic !== "general" &&
+    currentTopic.confidence > 0.5
+  ) {
+    const topicKeywords = currentTopic.keywords.join(" ");
+    const enhancedQuery = `${userQuery} ${topicKeywords} ${currentTopic.topic}`;
+    console.log(`Enhanced query with topic context: ${enhancedQuery}`);
+    return enhancedQuery;
+  }
+
+  return userQuery;
 }
 
 // Load scenario configurations asynchronously from URL
@@ -231,11 +238,15 @@ async function loadScenarioConfigs() {
     // If fetch fails, retain potentially stale data but log the error.
     // Only reset to default if scenarioConfigs is empty.
     if (scenarioConfigs.length === 0) {
-      scenarioConfigs = [{
-        id: "General",
-        Stage1DocInstructions: "Provide a clear and contextual response based on the provided information.",
-        Stage2HistoryInstructions: "Refine the prepared response for continuity and clarity. Always answer in Turkish",
-      }, ];
+      scenarioConfigs = [
+        {
+          id: "General",
+          Stage1DocInstructions:
+            "Provide a clear and contextual response based on the provided information.",
+          Stage2HistoryInstructions:
+            "Refine the prepared response for continuity and clarity. Always answer in Turkish",
+        },
+      ];
       console.warn(
         "Using default scenario configurations due to fetch error on initial load."
       );
@@ -251,7 +262,13 @@ async function loadScenarioConfigs() {
 loadScenarioConfigs();
 
 // Prompt template for Stage 1: Retrieve info based on knowledge base
-function getStage1Prompt(retrievedDocs, userQuery, scenarioType, personalizationContext) {
+function getStage1Prompt(
+  retrievedDocs,
+  userQuery,
+  scenarioType,
+  personalizationContext,
+  conversationContext = ""
+) {
   const context = retrievedDocs
     .map((doc) => doc.node.text)
     .join(
@@ -301,7 +318,9 @@ If the query is a purely conversational Turkish expression (e.g., "selam", "merh
   }</context>
   <query>${userQuery}</query>
   <scenario_type>${scenarioType || "General"}</scenario_type>
-  <task>${finalTaskInstructions}</task>${personalizationContext || ""}
+  <task>${finalTaskInstructions}</task>${conversationContext || ""}${
+    personalizationContext || ""
+  }
 </prompt>
 `;
 }
@@ -330,7 +349,10 @@ function getStage2Prompt(
         return null; // Skip messages with empty content
       }
       return {
-        role: msg.node.metadata && msg.node.metadata.role === "user" ? "user" : "assistant",
+        role:
+          msg.node.metadata && msg.node.metadata.role === "user"
+            ? "user"
+            : "assistant",
         content: content,
       };
     })
@@ -338,7 +360,7 @@ function getStage2Prompt(
 
   // For specific scenarios (like SQL), add any additional specific messages that aren't already in expanded history
   const specificMessages = [];
-  if (scenarioType === "SQL" && chatHistory.length > 0) {
+  if (scenarioType.includes("SQL") && chatHistory.length > 0) {
     // For SQL scenarios, add specific messages that might not be in expanded history
     const expandedTexts = new Set(
       expandedChatHistory.map((msg) => msg.node.text)
@@ -348,7 +370,8 @@ function getStage2Prompt(
       const content = msg.text || "";
       if (content && !expandedTexts.has(content)) {
         specificMessages.push({
-          role: msg.metadata && msg.metadata.role === "user" ? "user" : "assistant",
+          role:
+            msg.metadata && msg.metadata.role === "user" ? "user" : "assistant",
           content: content,
         });
       }
@@ -356,13 +379,17 @@ function getStage2Prompt(
   }
 
   // Construct the message array
-  const messages = [{
+  const messages = [
+    {
       role: "system",
-      content: `${agentPrompt} ${stage2Instructions}${personalizationContext || ""}`, // Include personalization context
+      content: `${agentPrompt} ${stage2Instructions}${
+        personalizationContext || ""
+      }`, // Include personalization context
     },
     {
       role: "system",
-      content: "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n" +
+      content:
+        "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n" +
         "Language: MUST always answer in Turkish",
     },
     // Add expanded history messages for broader context
@@ -396,7 +423,9 @@ async function fetchUserAnalytics(userId, stage) {
   };
 
   try {
-    console.log(`Fetching analytics for userId: ${userId} from table: ${tableName}`);
+    console.log(
+      `Fetching analytics for userId: ${userId} from table: ${tableName}`
+    );
     const result = await dynamoDbClient.send(new GetCommand(params));
 
     if (result.Item) {
@@ -419,21 +448,25 @@ async function fetchRealtimeAnalysis(conversationId, stage) {
 
   const params = {
     TableName: tableName,
-    KeyConditionExpression: 'conversationId = :conversationId',
+    KeyConditionExpression: "conversationId = :conversationId",
     ExpressionAttributeValues: {
-      ':conversationId': conversationId,
+      ":conversationId": conversationId,
     },
     ScanIndexForward: false, // Get most recent items first
-    Limit: 10 // Get last 10 analysis entries
+    Limit: 10, // Get last 10 analysis entries
   };
 
   try {
-    console.log(`Fetching real-time analysis for conversationId: ${conversationId} from table: ${tableName}`);
+    console.log(
+      `Fetching real-time analysis for conversationId: ${conversationId} from table: ${tableName}`
+    );
     const command = new QueryCommand(params);
     const result = await dynamoDbClient.send(command);
 
     if (result.Items && result.Items.length > 0) {
-      console.log(`Found ${result.Items.length} real-time analysis entries, using latest`);
+      console.log(
+        `Found ${result.Items.length} real-time analysis entries, using latest`
+      );
       return result.Items[0]; // Return the most recent analysis (first item due to ScanIndexForward: false)
     } else {
       console.log("No real-time analysis data found for this conversation");
@@ -456,20 +489,31 @@ function extractRealtimePersonalizationContext(realtimeData) {
   return {
     // Engagement context
     engagementLevel: (analysis.engagement && analysis.engagement.level) || 0.5,
-    engagementType: (analysis.engagement && analysis.engagement.type) || "neutral",
-    engagementIndicators: (analysis.engagement && analysis.engagement.indicators) || [],
+    engagementType:
+      (analysis.engagement && analysis.engagement.type) || "neutral",
+    engagementIndicators:
+      (analysis.engagement && analysis.engagement.indicators) || [],
 
     // Sentiment and emotional state
-    currentSentiment: (analysis.sentiment && analysis.sentiment.sentiment) || "neutral",
-    sentimentIntensity: (analysis.sentiment && analysis.sentiment.intensity) || 0.5,
-    sentimentConfidence: (analysis.sentiment && analysis.sentiment.confidence) || 0.5,
+    currentSentiment:
+      (analysis.sentiment && analysis.sentiment.sentiment) || "neutral",
+    sentimentIntensity:
+      (analysis.sentiment && analysis.sentiment.intensity) || 0.5,
+    sentimentConfidence:
+      (analysis.sentiment && analysis.sentiment.confidence) || 0.5,
     currentEmotions: (analysis.sentiment && analysis.sentiment.emotions) || [],
 
     // Understanding and comprehension
-    understandingLevel: (analysis.understanding && analysis.understanding.understanding_level) || "moderate",
-    understandingConfidence: (analysis.understanding && analysis.understanding.confidence) || 0.5,
-    needsClarification: (analysis.understanding && analysis.understanding.needs_clarification) || [],
-    misconceptions: (analysis.understanding && analysis.understanding.misconceptions) || [],
+    understandingLevel:
+      (analysis.understanding && analysis.understanding.understanding_level) ||
+      "moderate",
+    understandingConfidence:
+      (analysis.understanding && analysis.understanding.confidence) || 0.5,
+    needsClarification:
+      (analysis.understanding && analysis.understanding.needs_clarification) ||
+      [],
+    misconceptions:
+      (analysis.understanding && analysis.understanding.misconceptions) || [],
 
     // Error patterns and suggestions
     hasErrors: (analysis.errors && analysis.errors.detected) || false,
@@ -481,7 +525,7 @@ function extractRealtimePersonalizationContext(realtimeData) {
 
     // Timestamp for context
     analysisTimestamp: analysis.timestamp,
-    messageId: analysis.messageId
+    messageId: analysis.messageId,
   };
 }
 
@@ -497,7 +541,9 @@ function createRealtimePersonalizationPrompt(realtimeData) {
   realtimePrompt += "<current_engagement>\n";
   realtimePrompt += `- Engagement level: ${realtimeData.engagementLevel} (${realtimeData.engagementType})\n`;
   if (realtimeData.engagementIndicators.length > 0) {
-    realtimePrompt += `- Engagement indicators: ${realtimeData.engagementIndicators.join(', ')}\n`;
+    realtimePrompt += `- Engagement indicators: ${realtimeData.engagementIndicators.join(
+      ", "
+    )}\n`;
   }
   realtimePrompt += "</current_engagement>\n";
 
@@ -505,7 +551,9 @@ function createRealtimePersonalizationPrompt(realtimeData) {
   realtimePrompt += "<current_sentiment>\n";
   realtimePrompt += `- Sentiment: ${realtimeData.currentSentiment} (intensity: ${realtimeData.sentimentIntensity})\n`;
   if (realtimeData.currentEmotions.length > 0) {
-    realtimePrompt += `- Current emotions: ${realtimeData.currentEmotions.join(', ')}\n`;
+    realtimePrompt += `- Current emotions: ${realtimeData.currentEmotions.join(
+      ", "
+    )}\n`;
   }
   realtimePrompt += "</current_sentiment>\n";
 
@@ -514,10 +562,14 @@ function createRealtimePersonalizationPrompt(realtimeData) {
   realtimePrompt += `- Understanding level: ${realtimeData.understandingLevel}\n`;
   realtimePrompt += `- Confidence in understanding: ${realtimeData.understandingConfidence}\n`;
   if (realtimeData.needsClarification.length > 0) {
-    realtimePrompt += `- Needs clarification: ${realtimeData.needsClarification.join('; ')}\n`;
+    realtimePrompt += `- Needs clarification: ${realtimeData.needsClarification.join(
+      "; "
+    )}\n`;
   }
   if (realtimeData.misconceptions.length > 0) {
-    realtimePrompt += `- Misconceptions detected: ${realtimeData.misconceptions.join('; ')}\n`;
+    realtimePrompt += `- Misconceptions detected: ${realtimeData.misconceptions.join(
+      "; "
+    )}\n`;
   }
   realtimePrompt += "</understanding_assessment>\n";
 
@@ -527,7 +579,9 @@ function createRealtimePersonalizationPrompt(realtimeData) {
     realtimePrompt += `- Errors detected: ${realtimeData.hasErrors}\n`;
     realtimePrompt += `- Error severity: ${realtimeData.errorSeverity}\n`;
     if (realtimeData.errorSuggestions.length > 0) {
-      realtimePrompt += `- Suggestions: ${realtimeData.errorSuggestions.join('; ')}\n`;
+      realtimePrompt += `- Suggestions: ${realtimeData.errorSuggestions.join(
+        "; "
+      )}\n`;
     }
     realtimePrompt += "</error_context>\n";
   }
@@ -535,8 +589,10 @@ function createRealtimePersonalizationPrompt(realtimeData) {
   // Triggers and concerns
   if (realtimeData.triggers.length > 0) {
     realtimePrompt += "<current_triggers>\n";
-    realtimeData.triggers.forEach(trigger => {
-      realtimePrompt += `- ${trigger.type} (${trigger.severity}): ${JSON.stringify(trigger.data)}\n`;
+    realtimeData.triggers.forEach((trigger) => {
+      realtimePrompt += `- ${trigger.type} (${
+        trigger.severity
+      }): ${JSON.stringify(trigger.data)}\n`;
     });
     realtimePrompt += "</current_triggers>\n";
   }
@@ -546,21 +602,29 @@ function createRealtimePersonalizationPrompt(realtimeData) {
 
   // Engagement-based adaptations
   if (realtimeData.engagementLevel < 0.3) {
-    realtimePrompt += "- LOW ENGAGEMENT DETECTED: Use more engaging, interactive approaches. Ask direct questions. Use simpler language.\n";
+    realtimePrompt +=
+      "- LOW ENGAGEMENT DETECTED: Use more engaging, interactive approaches. Ask direct questions. Use simpler language.\n";
   } else if (realtimeData.engagementLevel > 0.7) {
-    realtimePrompt += "- HIGH ENGAGEMENT: User is actively engaged. Can use more complex concepts and deeper discussions.\n";
+    realtimePrompt +=
+      "- HIGH ENGAGEMENT: User is actively engaged. Can use more complex concepts and deeper discussions.\n";
   }
 
   // Understanding-based adaptations
-  if (realtimeData.understandingLevel === "none" || realtimeData.understandingLevel === "low") {
-    realtimePrompt += "- LOW UNDERSTANDING: Simplify explanations. Use more examples. Check comprehension frequently.\n";
+  if (
+    realtimeData.understandingLevel === "none" ||
+    realtimeData.understandingLevel === "low"
+  ) {
+    realtimePrompt +=
+      "- LOW UNDERSTANDING: Simplify explanations. Use more examples. Check comprehension frequently.\n";
   }
 
   // Sentiment-based adaptations
   if (realtimeData.currentSentiment === "negative") {
-    realtimePrompt += "- NEGATIVE SENTIMENT: Be more supportive and encouraging. Address concerns directly.\n";
+    realtimePrompt +=
+      "- NEGATIVE SENTIMENT: Be more supportive and encouraging. Address concerns directly.\n";
   } else if (realtimeData.currentSentiment === "positive") {
-    realtimePrompt += "- POSITIVE SENTIMENT: Build on positive momentum. Can introduce new challenges.\n";
+    realtimePrompt +=
+      "- POSITIVE SENTIMENT: Build on positive momentum. Can introduce new challenges.\n";
   }
 
   realtimePrompt += "</adaptation_guidelines>\n";
@@ -580,35 +644,94 @@ function extractPersonalizationContext(analyticsData) {
   // Extract key personalization fields
   const personalization = {
     // Communication preferences
-    communicationGuidelines: (analysis.personalizationInsights && analysis.personalizationInsights.communicationGuidelines) || {},
-    personalizedGreeting: (analysis.personalizationInsights && analysis.personalizationInsights.personalizedGreeting) || "",
+    communicationGuidelines:
+      (analysis.personalizationInsights &&
+        analysis.personalizationInsights.communicationGuidelines) ||
+      {},
+    personalizedGreeting:
+      (analysis.personalizationInsights &&
+        analysis.personalizationInsights.personalizedGreeting) ||
+      "",
 
     // Content and learning preferences
-    contentRecommendations: (analysis.personalizationInsights && analysis.personalizationInsights.contentRecommendations) || {},
-    learningStyle: (analysis.learningPatterns && analysis.learningPatterns.learningStyle && analysis.learningPatterns.learningStyle.primary) || "mixed",
-    preferredInteractionStyle: (analysis.learningPatterns && analysis.learningPatterns.engagementPatterns && analysis.learningPatterns.engagementPatterns.preferredInteractionStyle) || "collaborative",
-    explanationPreferences: (analysis.learningPatterns && analysis.learningPatterns.explanationPreferences) || [],
+    contentRecommendations:
+      (analysis.personalizationInsights &&
+        analysis.personalizationInsights.contentRecommendations) ||
+      {},
+    learningStyle:
+      (analysis.learningPatterns &&
+        analysis.learningPatterns.learningStyle &&
+        analysis.learningPatterns.learningStyle.primary) ||
+      "mixed",
+    preferredInteractionStyle:
+      (analysis.learningPatterns &&
+        analysis.learningPatterns.engagementPatterns &&
+        analysis.learningPatterns.engagementPatterns
+          .preferredInteractionStyle) ||
+      "collaborative",
+    explanationPreferences:
+      (analysis.learningPatterns &&
+        analysis.learningPatterns.explanationPreferences) ||
+      [],
 
     // Emotional and engagement context
-    overallMood: (analysis.emotionalState && analysis.emotionalState.overallMood) || "neutral",
-    confidenceLevel: (analysis.skillAssessment && analysis.skillAssessment.confidence) || 0.5,
-    currentSkillLevel: (analysis.skillAssessment && analysis.skillAssessment.currentLevel) || "intermediate",
-    engagementLevel: (analysis.emotionalState && analysis.emotionalState.engagementLevel && analysis.emotionalState.engagementLevel.overall) || 0.5,
+    overallMood:
+      (analysis.emotionalState && analysis.emotionalState.overallMood) ||
+      "neutral",
+    confidenceLevel:
+      (analysis.skillAssessment && analysis.skillAssessment.confidence) || 0.5,
+    currentSkillLevel:
+      (analysis.skillAssessment && analysis.skillAssessment.currentLevel) ||
+      "intermediate",
+    engagementLevel:
+      (analysis.emotionalState &&
+        analysis.emotionalState.engagementLevel &&
+        analysis.emotionalState.engagementLevel.overall) ||
+      0.5,
 
     // Topic interests and preferences
-    highInterestTopics: (analysis.topicAnalysis && analysis.topicAnalysis.interestIndicators && analysis.topicAnalysis.interestIndicators.highInterestTopics) || [],
-    lowInterestTopics: (analysis.topicAnalysis && analysis.topicAnalysis.interestIndicators && analysis.topicAnalysis.interestIndicators.lowInterestTopics) || [],
-    strugglingConcepts: (analysis.skillAssessment && analysis.skillAssessment.strugglingConcepts) || [],
-    masteredConcepts: (analysis.skillAssessment && analysis.skillAssessment.masteredConcepts) || [],
+    highInterestTopics:
+      (analysis.topicAnalysis &&
+        analysis.topicAnalysis.interestIndicators &&
+        analysis.topicAnalysis.interestIndicators.highInterestTopics) ||
+      [],
+    lowInterestTopics:
+      (analysis.topicAnalysis &&
+        analysis.topicAnalysis.interestIndicators &&
+        analysis.topicAnalysis.interestIndicators.lowInterestTopics) ||
+      [],
+    strugglingConcepts:
+      (analysis.skillAssessment &&
+        analysis.skillAssessment.strugglingConcepts) ||
+      [],
+    masteredConcepts:
+      (analysis.skillAssessment && analysis.skillAssessment.masteredConcepts) ||
+      [],
 
     // Session suggestions
-    nextSessionSuggestions: (analysis.personalizationInsights && analysis.personalizationInsights.nextSessionSuggestions) || {},
-    learningGoals: (analysis.personalizationInsights && analysis.personalizationInsights.learningGoals) || {},
+    nextSessionSuggestions:
+      (analysis.personalizationInsights &&
+        analysis.personalizationInsights.nextSessionSuggestions) ||
+      {},
+    learningGoals:
+      (analysis.personalizationInsights &&
+        analysis.personalizationInsights.learningGoals) ||
+      {},
 
     // Additional context
-    attentionSpan: (analysis.learningPatterns && analysis.learningPatterns.attentionSpan && analysis.learningPatterns.attentionSpan.estimatedMinutes) || 10,
-    pacingPreference: (analysis.learningPatterns && analysis.learningPatterns.pacingPreference) || "moderate",
-    motivationalTriggers: (analysis.learningPatterns && analysis.learningPatterns.motivationalTriggers) || []
+    attentionSpan:
+      (analysis.learningPatterns &&
+        analysis.learningPatterns.attentionSpan &&
+        analysis.learningPatterns.attentionSpan.estimatedMinutes) ||
+      10,
+    pacingPreference:
+      (analysis.learningPatterns &&
+        analysis.learningPatterns.pacingPreference) ||
+      "moderate",
+    motivationalTriggers:
+      (analysis.learningPatterns &&
+        analysis.learningPatterns.motivationalTriggers) ||
+      [],
   };
 
   return personalization;
@@ -623,81 +746,130 @@ function createPersonalizationPrompt(personalizationData) {
   let personalizationPrompt = "\n<personalization_context>\n";
 
   // Communication style guidelines
-  if (personalizationData.communicationGuidelines && Object.keys(personalizationData.communicationGuidelines).length > 0) {
+  if (
+    personalizationData.communicationGuidelines &&
+    Object.keys(personalizationData.communicationGuidelines).length > 0
+  ) {
     const guidelines = personalizationData.communicationGuidelines;
     personalizationPrompt += "<communication_style>\n";
-    if (guidelines.tone) personalizationPrompt += `- Tone: ${guidelines.tone}\n`;
-    if (guidelines.complexity) personalizationPrompt += `- Language complexity: ${guidelines.complexity}\n`;
-    if (guidelines.responseLength) personalizationPrompt += `- Preferred response length: ${guidelines.responseLength}\n`;
-    if (guidelines.encouragementLevel) personalizationPrompt += `- Encouragement level: ${guidelines.encouragementLevel}\n`;
-    if (guidelines.useAnalogies) personalizationPrompt += `- Use analogies: ${guidelines.useAnalogies ? 'yes' : 'no'}\n`;
-    if (guidelines.useHumor) personalizationPrompt += `- Use humor: ${guidelines.useHumor ? 'yes' : 'no'}\n`;
+    if (guidelines.tone)
+      personalizationPrompt += `- Tone: ${guidelines.tone}\n`;
+    if (guidelines.complexity)
+      personalizationPrompt += `- Language complexity: ${guidelines.complexity}\n`;
+    if (guidelines.responseLength)
+      personalizationPrompt += `- Preferred response length: ${guidelines.responseLength}\n`;
+    if (guidelines.encouragementLevel)
+      personalizationPrompt += `- Encouragement level: ${guidelines.encouragementLevel}\n`;
+    if (guidelines.useAnalogies)
+      personalizationPrompt += `- Use analogies: ${
+        guidelines.useAnalogies ? "yes" : "no"
+      }\n`;
+    if (guidelines.useHumor)
+      personalizationPrompt += `- Use humor: ${
+        guidelines.useHumor ? "yes" : "no"
+      }\n`;
     personalizationPrompt += "</communication_style>\n";
   }
 
   // Learning preferences
   personalizationPrompt += "<learning_preferences>\n";
-  if (personalizationData.learningStyle) personalizationPrompt += `- Learning style: ${personalizationData.learningStyle}\n`;
-  if (personalizationData.preferredInteractionStyle) personalizationPrompt += `- Interaction style: ${personalizationData.preferredInteractionStyle}\n`;
+  if (personalizationData.learningStyle)
+    personalizationPrompt += `- Learning style: ${personalizationData.learningStyle}\n`;
+  if (personalizationData.preferredInteractionStyle)
+    personalizationPrompt += `- Interaction style: ${personalizationData.preferredInteractionStyle}\n`;
   if (personalizationData.explanationPreferences.length > 0) {
-    personalizationPrompt += `- Explanation preferences: ${personalizationData.explanationPreferences.join(', ')}\n`;
+    personalizationPrompt += `- Explanation preferences: ${personalizationData.explanationPreferences.join(
+      ", "
+    )}\n`;
   }
-  if (personalizationData.pacingPreference) personalizationPrompt += `- Pacing preference: ${personalizationData.pacingPreference}\n`;
+  if (personalizationData.pacingPreference)
+    personalizationPrompt += `- Pacing preference: ${personalizationData.pacingPreference}\n`;
   personalizationPrompt += "</learning_preferences>\n";
 
   // Current state and context
   personalizationPrompt += "<user_context>\n";
-  if (personalizationData.overallMood) personalizationPrompt += `- Current mood: ${personalizationData.overallMood}\n`;
-  if (personalizationData.currentSkillLevel) personalizationPrompt += `- Skill level: ${personalizationData.currentSkillLevel}\n`;
-  if (personalizationData.confidenceLevel) personalizationPrompt += `- Confidence level: ${personalizationData.confidenceLevel}\n`;
-  if (personalizationData.engagementLevel) personalizationPrompt += `- Engagement level: ${personalizationData.engagementLevel}\n`;
-  if (personalizationData.attentionSpan) personalizationPrompt += `- Estimated attention span: ${personalizationData.attentionSpan} minutes\n`;
+  if (personalizationData.overallMood)
+    personalizationPrompt += `- Current mood: ${personalizationData.overallMood}\n`;
+  if (personalizationData.currentSkillLevel)
+    personalizationPrompt += `- Skill level: ${personalizationData.currentSkillLevel}\n`;
+  if (personalizationData.confidenceLevel)
+    personalizationPrompt += `- Confidence level: ${personalizationData.confidenceLevel}\n`;
+  if (personalizationData.engagementLevel)
+    personalizationPrompt += `- Engagement level: ${personalizationData.engagementLevel}\n`;
+  if (personalizationData.attentionSpan)
+    personalizationPrompt += `- Estimated attention span: ${personalizationData.attentionSpan} minutes\n`;
   personalizationPrompt += "</user_context>\n";
 
   // Topic interests
-  if (personalizationData.highInterestTopics.length > 0 || personalizationData.lowInterestTopics.length > 0) {
+  if (
+    personalizationData.highInterestTopics.length > 0 ||
+    personalizationData.lowInterestTopics.length > 0
+  ) {
     personalizationPrompt += "<topic_preferences>\n";
     if (personalizationData.highInterestTopics.length > 0) {
-      personalizationPrompt += `- High interest topics: ${personalizationData.highInterestTopics.join(', ')}\n`;
+      personalizationPrompt += `- High interest topics: ${personalizationData.highInterestTopics.join(
+        ", "
+      )}\n`;
     }
     if (personalizationData.lowInterestTopics.length > 0) {
-      personalizationPrompt += `- Low interest topics: ${personalizationData.lowInterestTopics.join(', ')}\n`;
+      personalizationPrompt += `- Low interest topics: ${personalizationData.lowInterestTopics.join(
+        ", "
+      )}\n`;
     }
     personalizationPrompt += "</topic_preferences>\n";
   }
 
   // Learning progress
-  if (personalizationData.masteredConcepts.length > 0 || personalizationData.strugglingConcepts.length > 0) {
+  if (
+    personalizationData.masteredConcepts.length > 0 ||
+    personalizationData.strugglingConcepts.length > 0
+  ) {
     personalizationPrompt += "<learning_progress>\n";
     if (personalizationData.masteredConcepts.length > 0) {
-      personalizationPrompt += `- Mastered concepts: ${personalizationData.masteredConcepts.join(', ')}\n`;
+      personalizationPrompt += `- Mastered concepts: ${personalizationData.masteredConcepts.join(
+        ", "
+      )}\n`;
     }
     if (personalizationData.strugglingConcepts.length > 0) {
-      personalizationPrompt += `- Struggling with: ${personalizationData.strugglingConcepts.join(', ')}\n`;
+      personalizationPrompt += `- Struggling with: ${personalizationData.strugglingConcepts.join(
+        ", "
+      )}\n`;
     }
     personalizationPrompt += "</learning_progress>\n";
   }
 
   // Content recommendations
-  if (personalizationData.contentRecommendations && Object.keys(personalizationData.contentRecommendations).length > 0) {
+  if (
+    personalizationData.contentRecommendations &&
+    Object.keys(personalizationData.contentRecommendations).length > 0
+  ) {
     const content = personalizationData.contentRecommendations;
     personalizationPrompt += "<content_guidance>\n";
     if (content.emphasizeTopics && content.emphasizeTopics.length > 0) {
-      personalizationPrompt += `- Emphasize topics: ${content.emphasizeTopics.join(', ')}\n`;
+      personalizationPrompt += `- Emphasize topics: ${content.emphasizeTopics.join(
+        ", "
+      )}\n`;
     }
     if (content.avoidTopics && content.avoidTopics.length > 0) {
-      personalizationPrompt += `- Avoid topics: ${content.avoidTopics.join(', ')}\n`;
+      personalizationPrompt += `- Avoid topics: ${content.avoidTopics.join(
+        ", "
+      )}\n`;
     }
-    if (content.difficulty) personalizationPrompt += `- Preferred difficulty: ${content.difficulty}\n`;
+    if (content.difficulty)
+      personalizationPrompt += `- Preferred difficulty: ${content.difficulty}\n`;
     if (content.format && content.format.length > 0) {
-      personalizationPrompt += `- Preferred formats: ${content.format.join(', ')}\n`;
+      personalizationPrompt += `- Preferred formats: ${content.format.join(
+        ", "
+      )}\n`;
     }
     personalizationPrompt += "</content_guidance>\n";
   }
 
   // Motivational context
   if (personalizationData.motivationalTriggers.length > 0) {
-    personalizationPrompt += `<motivational_triggers>\n- ${personalizationData.motivationalTriggers.join(', ')}\n</motivational_triggers>\n`;
+    personalizationPrompt += `<motivational_triggers>\n- ${personalizationData.motivationalTriggers.join(
+      ", "
+    )}\n</motivational_triggers>\n`;
   }
 
   // Personalized greeting for context
@@ -741,42 +913,74 @@ function mapGroupToScenarioType(groupInfo) {
 
 // Controller to handle streaming reflection requests
 export async function handleWhatToAskController(req, res) {
-  const {
-    userId,
-    conversationId
-  } = req.params;
+  const { userId, conversationId } = req.params;
   console.log("conversationId:", conversationId);
   console.log("userId:", userId);
-  const {
-    query,
-    assistantId,
-    type,
-    stage
-  } = req.body;
+  const { query, assistantId, type, stage } = req.body;
 
-  let fullOutput = ''; // Track the complete response for analysis
+  let fullOutput = ""; // Track the complete response for analysis
 
   try {
+    // Create indices for both chat messages and assistant documents
+    const { index_chat_messages, index_assistant_documents } =
+      await createIndices();
+
+    // Initialize conversation memory service with vector index
+    const memoryService = new ConversationMemoryService(stage);
+    memoryService.setVectorIndex(index_chat_messages); // 🔥 FIX: Set vector index for unified retrieval
+
     // Ensure latest scenario configs are loaded (respecting cache duration)
     await loadScenarioConfigs();
+
+    // WUP-806 FIX: Get comprehensive conversation context using vector DB
+    console.log("Fetching conversation context for memory continuity...");
+    const conversationContext = await memoryService.getConversationContext(
+      conversationId,
+      30, // Get last 30 messages for better context
+      3000 // Allow up to 3000 tokens for conversation history
+    );
+
+    const conversationContextPrompt =
+      memoryService.createConversationContextPrompt(conversationContext);
+    console.log("Conversation context prepared:", {
+      messageCount: conversationContext.metadata.totalMessages,
+      currentTopic: conversationContext.context.currentTopic?.topic,
+      userLevel: conversationContext.context.userProfile?.skillLevel?.level,
+      conversationPhase: conversationContext.context.conversationFlow?.phase,
+      dataSource: conversationContext.metadata.dataSource, // Track which source was used
+    });
 
     // Fetch user analytics for personalization - use userId instead of conversationId
     console.log("Fetching user analytics for personalization...");
     const analyticsData = await fetchUserAnalytics(userId, stage);
     const personalizationData = extractPersonalizationContext(analyticsData);
-    const personalizationPrompt = createPersonalizationPrompt(personalizationData);
+    const personalizationPrompt =
+      createPersonalizationPrompt(personalizationData);
 
     // Fetch real-time analysis for immediate personalization - use conversationId
     console.log("Fetching real-time analysis for immediate personalization...");
-    const realtimeAnalysisData = await fetchRealtimeAnalysis(conversationId, stage);
-    const realtimePersonalizationData = extractRealtimePersonalizationContext(realtimeAnalysisData);
-    const realtimePersonalizationPrompt = createRealtimePersonalizationPrompt(realtimePersonalizationData);
+    const realtimeAnalysisData = await fetchRealtimeAnalysis(
+      conversationId,
+      stage
+    );
+    const realtimePersonalizationData =
+      extractRealtimePersonalizationContext(realtimeAnalysisData);
+    const realtimePersonalizationPrompt = createRealtimePersonalizationPrompt(
+      realtimePersonalizationData
+    );
 
     // Combine both personalization contexts
-    const combinedPersonalizationPrompt = personalizationPrompt + realtimePersonalizationPrompt;
+    const combinedPersonalizationPrompt =
+      personalizationPrompt + realtimePersonalizationPrompt;
 
-    console.log("Personalization context prepared:", personalizationData ? "Yes" : "No");
-    console.log("Real-time personalization context prepared:", realtimePersonalizationData ? "Yes" : "No");
+    console.log(
+      "Personalization context prepared:",
+      personalizationData ? "Yes" : "No"
+    );
+    console.log(
+      "Real-time personalization context prepared:",
+      realtimePersonalizationData ? "Yes" : "No"
+    );
 
     const systemMessage = await fetchAssistantConfig(assistantId, stage);
     if (!systemMessage || !systemMessage.prompt)
@@ -828,99 +1032,146 @@ export async function handleWhatToAskController(req, res) {
 
     await initializeSettings(assistantConfig);
 
-    // Create indices for both chat messages and assistant documents
-    const {
-      index_chat_messages,
-      index_assistant_documents
-    } =
-    await createIndices();
-
-    // --- Logic to get chat history (potentially for level extraction and Stage 2 prompt) ---
-    const chatHistoryRetriever = createChatRetriever({
-      index_chat_messages,
-      conversationId,
-    });
-    const retrievedChatMessages = await chatHistoryRetriever.retrieve(query);
-
+    // 🔥 NEW: Get specialized retrievers from memory service for different purposes
     let level = null;
     let chatHistoryForStage2Prompt = [];
+    let semanticChatMessages = [];
 
-    if (scenarioType === "SQL") {
-      console.log(
-        "SQL Scenario: Attempting to extract level from the relevant user message."
-      );
-      let relevantMessageNode = null;
-      let relevantMessageTextForLevel = "";
+    const dualRetrievers = memoryService.createDualRetrievers(conversationId);
 
-      if (retrievedChatMessages && retrievedChatMessages.length > 0) {
-        const userMessages = retrievedChatMessages.filter(
-          (msg) =>
-          msg.node.metadata && msg.node.metadata.role === "user" || !msg.node.metadata || !msg.node.metadata.role
+    if (dualRetrievers) {
+      console.log("Using vector-based retrievers for chat history");
+
+      // Get semantically relevant messages for current query
+      try {
+        semanticChatMessages = await dualRetrievers.semantic.retrieve(query);
+        console.log(
+          `Retrieved ${semanticChatMessages.length} semantically relevant messages`
         );
+      } catch (error) {
+        console.error("Error retrieving semantic messages:", error);
+        semanticChatMessages = [];
+      }
+    } else {
+      console.log(
+        "Vector retrievers not available, using conversation context messages"
+      );
+      // Fallback: Use messages from conversation context
+      semanticChatMessages = conversationContext.messages
+        .slice(-5)
+        .map((msg) => ({
+          node: {
+            text: msg.content,
+            metadata: { role: msg.role },
+          },
+        }));
+    }
 
-        // Find the specific message for level extraction
-        for (const msgNode of userMessages) {
-          const messageText = msgNode.node.text || "";
-          let lowerCaseText = messageText.toLowerCase();
-          lowerCaseText = lowerCaseText.replace(/i\u0307/g, "i"); // Normalize for Turkish 'İ'
-          if (lowerCaseText.startsWith("hangi seviyeden başlamak istersin")) {
-            relevantMessageNode = msgNode;
-            relevantMessageTextForLevel = messageText;
-            console.log(
-              "Identified relevant user message for SQL level extraction:",
-              relevantMessageTextForLevel
-            );
-            break; // Found the message, no need to check further
-          }
+    // Handle SQL level extraction and scenario-specific logic
+    if (scenarioType.includes("SQL")) {
+      console.log(
+        "SQL Scenario: Attempting to extract level from conversation context."
+      );
+
+      // Use conversation context messages for level extraction
+      const userMessages = conversationContext.messages.filter(
+        (msg) => msg.role === "user"
+      );
+      let relevantMessageForLevel = null;
+
+      // Find the specific message for level extraction
+      for (const message of userMessages) {
+        const messageText = message.content || "";
+        let lowerCaseText = messageText.toLowerCase();
+        lowerCaseText = lowerCaseText.replace(/i\u0307/g, "i"); // Normalize for Turkish 'İ'
+        if (lowerCaseText.startsWith("hangi seviyeden başlamak istersin")) {
+          relevantMessageForLevel = messageText;
+          console.log(
+            "Identified relevant user message for SQL level extraction:",
+            relevantMessageForLevel
+          );
+          break;
         }
       }
 
-      if (!relevantMessageTextForLevel && query) {
-        relevantMessageTextForLevel = query;
+      if (!relevantMessageForLevel && query) {
+        relevantMessageForLevel = query;
         console.log(
           "SQL Scenario: Using current query for level extraction as no specific user message was identified."
         );
       }
 
-      level = extractSqlLevel(relevantMessageTextForLevel); // extractSqlLevel already handles normalization
+      level = extractSqlLevel(relevantMessageForLevel || query);
       console.log(`SQL Scenario - Extracted level: ${level}`);
-      // For Stage 2 history, if we found the specific message, use it. Otherwise, empty or other logic might be needed.
-      // Based on previous logic, it seems we want to use this specific message if found.
-      chatHistoryForStage2Prompt = relevantMessageNode ? [relevantMessageNode] : [];
+
+      // For Stage 2 history, use SQL-related messages from conversation context
+      chatHistoryForStage2Prompt = conversationContext.messages
+        .filter((msg) => {
+          const content = msg.content.toLowerCase();
+          return (
+            content.includes("seviye") ||
+            content.includes("sql") ||
+            content.includes("join")
+          );
+        })
+        .slice(-3) // Get last 3 SQL-related messages
+        .map((msg) => ({
+          node: {
+            text: msg.content,
+            metadata: { role: msg.role },
+          },
+        }));
+
+      console.log(
+        `SQL Scenario: Using ${chatHistoryForStage2Prompt.length} SQL-related messages from conversation context`
+      );
     } else {
       console.log(
         "Non-SQL Scenario: Level extraction/filtering will not be applied."
       );
-      // For non-SQL scenarios, use standard filtered chat history for Stage 2 prompt
-      const chatHistoryMinScore = 0.25; // Default score for non-SQL chat history filtering
+      // For non-SQL scenarios, use semantically relevant messages
+      const chatHistoryMinScore = 0.25;
       chatHistoryForStage2Prompt = filterByScore(
-        retrievedChatMessages,
+        semanticChatMessages,
         chatHistoryMinScore
       );
       console.log(
         `Non-SQL Scenario - Filtered chatHistoryForStage2Prompt count: ${chatHistoryForStage2Prompt.length}`
       );
     }
-    // --- End: Level extraction and chat history setup for Stage 2 ---
 
     // Stage 1: Retrieve Knowledge & Generate Initial Response
+    // WUP-806 FIX: Use conversation context for better document retrieval
+    const contextAwareQuery = createContextAwareQuery(
+      query,
+      conversationContext
+    );
+
     const retriever_assistant = createAssistantRetriever({
       index_assistant_documents,
       assistantId,
       level, // Pass the extracted level
     });
-    let assistantDocs = await retriever_assistant.retrieve(query);
+
+    let assistantDocs = await retriever_assistant.retrieve(contextAwareQuery);
     console.log(
       "Stage 1: Retrieved assistantDocs count:",
       assistantDocs.length
     );
-    // Filter by score based on scenarioType
-    const assistantDocsMinScore = scenarioType === "SQL" ? 0.75 : 0.25;
+
+    // WUP-806 FIX: More lenient score filtering to preserve context
+    const assistantDocsMinScore = scenarioType.includes("SQL") ? 0.65 : 0.2; // Reduced thresholds for all SQL variants
     assistantDocs = filterByScore(assistantDocs, assistantDocsMinScore);
     console.log("Stage 1: Filtered assistantDocs count:", assistantDocs.length);
 
-    // Pass determined scenarioType to getStage1Prompt with personalization context
-    const stage1Prompt = getStage1Prompt(assistantDocs, query, scenarioType, combinedPersonalizationPrompt);
+    // WUP-806 FIX: Pass conversation context to Stage 1 prompt
+    const stage1Prompt = getStage1Prompt(
+      assistantDocs,
+      query,
+      scenarioType,
+      combinedPersonalizationPrompt,
+      conversationContextPrompt // Add conversation context
+    );
     console.log("\n--- Stage 1 Prompt ---\n", stage1Prompt);
 
     // Use Settings.llm directly for the first non-streaming call
@@ -930,40 +1181,31 @@ export async function handleWhatToAskController(req, res) {
     const stage1Response = stage1Completion.text;
     console.log("\n--- Stage 1 Response ---\n", stage1Response);
 
-    // Prepare expanded chat history for Stage 2 (without summarization)
-    // Separate user and assistant messages from retrieved chat messages
-    const userMessages = retrievedChatMessages.filter(
-      (msg) => msg.node.metadata && msg.node.metadata.role === "user" || !msg.node.metadata || !msg.node.metadata.role
-    );
-    const assistantMessages = retrievedChatMessages.filter(
-      (msg) => msg.node.metadata && msg.node.metadata.role === "assistant"
-    );
-
-    // Use all user messages (unfiltered for better context)
-    const allUserMessages = userMessages;
-
-    // Filter assistant messages by score for quality
-    const filteredAssistantMessages = filterByScore(assistantMessages, 0.25);
-
-    // Combine and sort messages by timestamp if available, otherwise maintain retrieval order
-    const expandedChatHistory = [
-      ...allUserMessages,
-      ...filteredAssistantMessages,
-    ];
+    // WUP-806 FIX: Use chronological conversation context from memory service
+    // Convert conversation memory format to stage2 format for compatibility
+    const expandedChatHistory = conversationContext.messages.map((msg) => ({
+      node: {
+        text: msg.content,
+        metadata: { role: msg.role },
+      },
+    }));
 
     console.log(
-      `Expanded chat history: ${allUserMessages.length} user messages, ${filteredAssistantMessages.length} assistant messages`
+      `WUP-806 FIX: Using unified message retrieval: ${expandedChatHistory.length} messages from ${conversationContext.metadata.dataSource}`
     );
 
-    // Use getStage2Prompt to construct the message array for the LLM with personalization
+    // WUP-806 FIX: Enhance Stage 2 with conversation context
+    const enhancedPersonalizationPrompt =
+      combinedPersonalizationPrompt + conversationContextPrompt;
+
     const stage2Messages = getStage2Prompt(
       stage1Response,
       chatHistoryForStage2Prompt, // Use the correctly scoped variable for specific scenario logic
-      expandedChatHistory, // Pass expanded history instead of summarized text
+      expandedChatHistory, // Pass chronological history from unified source
       query,
       scenarioType,
       agentPrompt,
-      combinedPersonalizationPrompt // Pass personalization context
+      enhancedPersonalizationPrompt // Include conversation context
     );
     console.log(
       "\n--- Stage 2 Messages ---\n",
@@ -991,29 +1233,34 @@ export async function handleWhatToAskController(req, res) {
     // 🔥 POST-STREAM: SQS + Real-time Analysis
     console.log("Starting post-stream analysis...");
 
-    // Get chat history count for analysis triggers
-    const chatHistoryCount = await getChatHistoryCount(conversationId);
+    // Get chat history count for analysis triggers using conversation context
+    const chatHistoryCount = conversationContext.metadata.totalMessages;
 
     // Create mock chat history array for analysis (similar to Lambda structure)
     const mockChatHistory = Array(chatHistoryCount).fill({
-      role: 'user',
-      content: 'message'
+      role: "user",
+      content: "message",
     });
 
     await Promise.all([
-      triggerRealtimeAnalysis(req.body, conversationId, userId, mockChatHistory, fullOutput),
-      sendToAnalysisQueues(req.body, conversationId, userId, mockChatHistory)
+      triggerRealtimeAnalysis(
+        req.body,
+        conversationId,
+        userId,
+        mockChatHistory,
+        fullOutput
+      ),
+      sendToAnalysisQueues(req.body, conversationId, userId, mockChatHistory),
     ]);
 
     console.log("Post-stream analysis completed successfully");
-
   } catch (err) {
     console.error("Error in handleWhatToAskController:", err);
 
     // If streaming hasn't started, send error response
     if (!res.headersSent) {
       res.status(500).json({
-        error: "An internal server error occurred."
+        error: "An internal server error occurred.",
       });
     }
   }
@@ -1067,43 +1314,54 @@ async function fetchAssistantGroupInfo(assistantId, stage) {
 }
 
 // 🔥 REAL-TIME ANALYSIS (Direct Lambda call for speed)
-async function triggerRealtimeAnalysis(requestBody, conversationId, userId, chatHistory, fullOutput) {
+async function triggerRealtimeAnalysis(
+  requestBody,
+  conversationId,
+  userId,
+  chatHistory,
+  fullOutput
+) {
   const realtimePayload = {
     message: {
       id: uuidv4(),
       content: requestBody.query,
-      role: 'user',
-      timestamp: new Date().toISOString()
+      role: "user",
+      timestamp: new Date().toISOString(),
     },
     conversationContext: {
       conversationId: conversationId,
       lastAssistantMessage: fullOutput,
       messageCount: chatHistory.length + 1,
-      assistantId: requestBody.assistantId
+      assistantId: requestBody.assistantId,
     },
     userId: userId,
-    assistantId: requestBody.assistantId
+    assistantId: requestBody.assistantId,
   };
 
   try {
     const command = new InvokeCommand({
       FunctionName: `realtimeMessageAnalysis-${process.env.STAGE}`,
-      InvocationType: 'Event',
+      InvocationType: "Event",
       Payload: JSON.stringify({
-        body: JSON.stringify(realtimePayload)
-      })
+        body: JSON.stringify(realtimePayload),
+      }),
     });
 
     await lambdaClient.send(command);
-    console.log('Real-time analysis triggered successfully');
+    console.log("Real-time analysis triggered successfully");
   } catch (error) {
-    console.error('Real-time analysis failed:', error);
+    console.error("Real-time analysis failed:", error);
     // Don't fail main flow for analysis errors
   }
 }
 
 // 🔥 SQS QUEUE INTEGRATION
-async function sendToAnalysisQueues(requestBody, conversationId, userId, chatHistory) {
+async function sendToAnalysisQueues(
+  requestBody,
+  conversationId,
+  userId,
+  chatHistory
+) {
   const messageCount = chatHistory.length + 1;
   const timestamp = new Date().toISOString();
   const analysisRequests = [];
@@ -1112,17 +1370,17 @@ async function sendToAnalysisQueues(requestBody, conversationId, userId, chatHis
   if (messageCount % 10 === 0) {
     analysisRequests.push({
       queue: ANALYSIS_QUEUE_URL,
-      priority: 'medium',
+      priority: "medium",
       message: {
         conversationId: conversationId,
         userId: userId,
-        triggerType: 'periodic_analysis',
+        triggerType: "periodic_analysis",
         messageCount: messageCount,
         metadata: {
           reason: `Periodic analysis at ${messageCount} messages`,
-          timestamp: timestamp
-        }
-      }
+          timestamp: timestamp,
+        },
+      },
     });
   }
 
@@ -1130,18 +1388,18 @@ async function sendToAnalysisQueues(requestBody, conversationId, userId, chatHis
   if (messageCount === 3) {
     analysisRequests.push({
       queue: PRIORITY_QUEUE_URL,
-      priority: 'high',
+      priority: "high",
       message: {
         conversationId: conversationId,
         userId: userId,
-        triggerType: 'initial_analysis',
+        triggerType: "initial_analysis",
         messageCount: messageCount,
         metadata: {
-          reason: 'Initial conversation analysis for personalization',
+          reason: "Initial conversation analysis for personalization",
           timestamp: timestamp,
-          urgency: 'immediate_personalization'
-        }
-      }
+          urgency: "immediate_personalization",
+        },
+      },
     });
   }
 
@@ -1149,18 +1407,18 @@ async function sendToAnalysisQueues(requestBody, conversationId, userId, chatHis
   if ([25, 50, 100].includes(messageCount)) {
     analysisRequests.push({
       queue: ANALYSIS_QUEUE_URL,
-      priority: 'medium',
+      priority: "medium",
       message: {
         conversationId: conversationId,
         userId: userId,
-        triggerType: 'milestone_analysis',
+        triggerType: "milestone_analysis",
         messageCount: messageCount,
         metadata: {
           reason: `Milestone analysis at ${messageCount} messages`,
           timestamp: timestamp,
-          milestone: messageCount
-        }
-      }
+          milestone: messageCount,
+        },
+      },
     });
   }
 
@@ -1169,77 +1427,75 @@ async function sendToAnalysisQueues(requestBody, conversationId, userId, chatHis
     const conversationStart = await getConversationStartTime(conversationId);
     const duration = Date.now() - conversationStart;
 
-    if (duration > 30 * 60 * 1000 && messageCount % 10 !== 0) { // Don't duplicate with periodic
+    if (duration > 30 * 60 * 1000 && messageCount % 10 !== 0) {
+      // Don't duplicate with periodic
       analysisRequests.push({
         queue: ANALYSIS_QUEUE_URL,
-        priority: 'medium',
+        priority: "medium",
         message: {
           conversationId: conversationId,
           userId: userId,
-          triggerType: 'time_based_analysis',
+          triggerType: "time_based_analysis",
           messageCount: messageCount,
           metadata: {
-            reason: 'Long conversation duration analysis',
+            reason: "Long conversation duration analysis",
             timestamp: timestamp,
-            duration: duration
-          }
-        }
+            duration: duration,
+          },
+        },
       });
     }
   } catch (error) {
-    console.error('Error checking conversation duration:', error);
+    console.error("Error checking conversation duration:", error);
   }
 
   // Send to SQS queues
   if (analysisRequests.length > 0) {
-    const sqsPromises = analysisRequests.map(request => sendToSQS(request));
+    const sqsPromises = analysisRequests.map((request) => sendToSQS(request));
     await Promise.all(sqsPromises);
     console.log(`Sent ${analysisRequests.length} analysis requests to SQS`);
   }
 }
 
 // 🔥 SQS SEND FUNCTION
-async function sendToSQS({
-  queue,
-  priority,
-  message
-}) {
+async function sendToSQS({ queue, priority, message }) {
   try {
     const messageAttributes = {
       userId: {
-        DataType: 'String',
-        StringValue: message.userId
+        DataType: "String",
+        StringValue: message.userId,
       },
       priority: {
-        DataType: 'String',
-        StringValue: priority
+        DataType: "String",
+        StringValue: priority,
       },
       conversationId: {
-        DataType: 'String',
-        StringValue: message.conversationId
+        DataType: "String",
+        StringValue: message.conversationId,
       },
       triggerType: {
-        DataType: 'String',
-        StringValue: message.triggerType
-      }
+        DataType: "String",
+        StringValue: message.triggerType,
+      },
     };
 
     const sqsParams = {
       QueueUrl: queue,
       MessageBody: JSON.stringify(message),
-      MessageAttributes: messageAttributes
+      MessageAttributes: messageAttributes,
     };
 
     // Add FIFO-specific parameters for priority queue
     if (queue === PRIORITY_QUEUE_URL) {
       sqsParams.MessageGroupId = message.conversationId;
-      sqsParams.MessageDeduplicationId = `${message.conversationId}-${message.messageCount}-${message.triggerType}-${Date.now()}`;
+      sqsParams.MessageDeduplicationId = `${message.conversationId}-${
+        message.messageCount
+      }-${message.triggerType}-${Date.now()}`;
     }
 
     const command = new SendMessageCommand(sqsParams);
     await sqsClient.send(command);
     console.log(`Sent ${message.triggerType} to ${priority} priority queue`);
-
   } catch (error) {
     console.error(`Error sending to SQS (${priority}):`, error);
     // Don't fail main flow for SQS errors
@@ -1253,12 +1509,12 @@ async function getConversationStartTime(conversationId) {
   const env = process.env.STAGE;
   const params = {
     TableName: `UpConversationMessage-${env}`,
-    KeyConditionExpression: 'conversationId = :conversationId',
+    KeyConditionExpression: "conversationId = :conversationId",
     ScanIndexForward: true,
     Limit: 1,
     ExpressionAttributeValues: {
-      ':conversationId': conversationId
-    }
+      ":conversationId": conversationId,
+    },
   };
 
   try {
@@ -1269,7 +1525,7 @@ async function getConversationStartTime(conversationId) {
     }
     return Date.now();
   } catch (error) {
-    console.error('Error getting conversation start time:', error);
+    console.error("Error getting conversation start time:", error);
     return Date.now();
   }
 }
@@ -1281,11 +1537,11 @@ async function getChatHistoryCount(conversationId) {
   const env = process.env.STAGE;
   const params = {
     TableName: `UpConversationMessage-${env}`,
-    KeyConditionExpression: 'conversationId = :conversationId',
-    Select: 'COUNT',
+    KeyConditionExpression: "conversationId = :conversationId",
+    Select: "COUNT",
     ExpressionAttributeValues: {
-      ':conversationId': conversationId
-    }
+      ":conversationId": conversationId,
+    },
   };
 
   try {
@@ -1293,7 +1549,7 @@ async function getChatHistoryCount(conversationId) {
     const result = await dynamoDbClient.send(command);
     return result.Count || 0;
   } catch (error) {
-    console.error('Error getting chat history count:', error);
+    console.error("Error getting chat history count:", error);
     return 0;
   }
 }
