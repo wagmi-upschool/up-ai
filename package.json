@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node app.js",
-    "dev": "node app.js"
+    "dev": "node app.js",
+    "test:memory": "node tests/memoryPersistenceTest.js",
+    "test:syntax": "node --check controllers/whatToAskController.js && node --check services/conversationMemoryService.js"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.682.0",
