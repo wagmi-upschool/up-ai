@@ -525,28 +525,16 @@ async function evaluateWithSemantics(expectedAnswer, actualAnswer) {
   }
 }
 
-/**
- * Calculate combined score from AI and semantic evaluations
- */
-function calculateCombinedScore(
-  aiScore,
-  semanticScore,
-  aiWeight = 0.6,
-  semanticWeight = 0.4
-) {
-  const combined = aiScore * aiWeight + semanticScore * semanticWeight;
-  return Math.round(combined * 10) / 10;
-}
 
 /**
- * Enhanced evaluation combining AI and semantic analysis
+ * Semantic-only evaluation with AI feedback (no AI scoring)
  */
-async function evaluateWithHybridSystem(
+async function evaluateWithSemanticSystem(
   question,
   expectedAnswer,
   actualAnswer
 ) {
-  console.log("🔄 Running hybrid evaluation (AI + Semantic)...");
+  console.log("🔄 Running semantic evaluation with AI feedback...");
 
   try {
     // Run both evaluations in parallel
@@ -555,47 +543,46 @@ async function evaluateWithHybridSystem(
       evaluateWithSemantics(expectedAnswer, actualAnswer),
     ]);
 
-    // Calculate combined score
-    const combinedScore = calculateCombinedScore(
-      aiEvaluation.score,
-      semanticEvaluation.score
-    );
+    // Use semantic score as the primary score
+    const finalScore = semanticEvaluation.score;
 
-    // Determine overall assessment
-    const threshold_met =
-      semanticEvaluation.threshold_met && aiEvaluation.score >= 6;
+    // Determine overall assessment based on semantic score only
+    const threshold_met = semanticEvaluation.threshold_met;
 
     return {
-      ai_evaluation: aiEvaluation,
+      ai_evaluation: {
+        evaluation: aiEvaluation.evaluation,
+        coaching: aiEvaluation.coaching,
+        full_evaluation: aiEvaluation.full_evaluation,
+      },
       semantic_evaluation: semanticEvaluation,
-      combined_score: combinedScore,
+      final_score: finalScore,
       evaluation_breakdown: {
-        ai_weight: 0.6,
-        semantic_weight: 0.4,
-        ai_score: aiEvaluation.score,
         semantic_score: semanticEvaluation.score,
-        final_score: combinedScore,
+        similarity: semanticEvaluation.similarity,
+        numerical_accuracy: semanticEvaluation.numerical_accuracy,
+        scoring_method: "semantic_only",
       },
       threshold_met: threshold_met,
       overall_assessment:
-        combinedScore >= 8
+        finalScore >= 8
           ? "EXCELLENT"
-          : combinedScore >= 6
+          : finalScore >= 6
           ? "GOOD"
-          : combinedScore >= 4
+          : finalScore >= 4
           ? "FAIR"
           : "NEEDS IMPROVEMENT",
     };
   } catch (error) {
-    console.error("Hybrid evaluation error:", error);
+    console.error("Semantic evaluation error:", error);
     return {
       ai_evaluation: {
-        score: 0,
         evaluation: "AI evaluation failed",
         coaching: "",
+        full_evaluation: "",
       },
       semantic_evaluation: { score: 0, similarity: 0, error: error.message },
-      combined_score: 0,
+      final_score: 0,
       error: error.message,
     };
   }
@@ -669,9 +656,9 @@ KOÇLUK: [Gelişim önerisi]`;
     const evaluation = data.choices[0].message.content;
 
     // Extract score, evaluation, and coaching
-    const scoreMatch = evaluation.match(/PUAN:\s*(\d+)/);
-    const evalMatch = evaluation.match(/DEĞERLENDİRME:\s*(.+?)(?=KOÇLUK:|$)/s);
-    const coachingMatch = evaluation.match(/KOÇLUK:\s*(.+)/s);
+    const scoreMatch = evaluation.match(/\*?\*?PUAN:\*?\*?\s*(\d+)/);
+    const evalMatch = evaluation.match(/\*?\*?DEĞERLENDİRME:\*?\*?\s*(.+?)(?=\*?\*?KOÇLUK:|$)/s);
+    const coachingMatch = evaluation.match(/\*?\*?KOÇLUK:\*?\*?\s*(.+)/s);
 
     const score = scoreMatch ? parseInt(scoreMatch[1]) : 0;
     const evalText = evalMatch ? evalMatch[1].trim() : evaluation;
@@ -714,7 +701,7 @@ async function preCacheExpectedAnswers() {
 async function runSimpleRAGValidation() {
   const startTime = Date.now();
 
-  console.log("🚀 Starting Hybrid RAG Validation (AI + Semantic Analysis)");
+  console.log("🚀 Starting Semantic RAG Validation (with AI Feedback)");
   console.log("=".repeat(70));
   console.log(`Target Conversation: ${CONFIG.conversationId}`);
   console.log(`Assistant ID: ${CONFIG.assistantId}`);
@@ -764,46 +751,45 @@ async function runSimpleRAGValidation() {
       questionResult.response = response;
 
       if (response.success && response.content) {
-        // Hybrid evaluation (AI + Semantic)
-        console.log(`🤖 Running hybrid evaluation (AI + Semantic)...`);
-        const hybridEval = await evaluateWithHybridSystem(
+        // Semantic evaluation with AI feedback (no AI scoring)
+        console.log(`🤖 Running semantic evaluation with AI feedback...`);
+        const semanticEval = await evaluateWithSemanticSystem(
           question.question,
           question.expectedAnswer,
           response.content
         );
 
-        questionResult.ai_evaluation = hybridEval.ai_evaluation;
-        questionResult.semantic_evaluation = hybridEval.semantic_evaluation;
-        questionResult.combined_score = hybridEval.combined_score;
-        questionResult.evaluation_breakdown = hybridEval.evaluation_breakdown;
+        questionResult.ai_evaluation = semanticEval.ai_evaluation;
+        questionResult.semantic_evaluation = semanticEval.semantic_evaluation;
+        questionResult.final_score = semanticEval.final_score;
+        questionResult.evaluation_breakdown = semanticEval.evaluation_breakdown;
         questionResult.success = true;
 
         // Display results
-        console.log(`🎯 AI Score: ${hybridEval.ai_evaluation.score}/10`);
         console.log(
-          `📊 Semantic Similarity: ${hybridEval.semantic_evaluation.similarity} (${hybridEval.semantic_evaluation.score}/10)`
+          `📊 Semantic Similarity: ${semanticEval.semantic_evaluation.similarity} (${semanticEval.semantic_evaluation.score}/10)`
         );
-        console.log(`🏆 Combined Score: ${hybridEval.combined_score}/10`);
-        console.log(`💭 AI Evaluation: ${hybridEval.ai_evaluation.evaluation}`);
+        console.log(`🏆 Final Score: ${semanticEval.final_score}/10`);
+        console.log(`💭 AI Evaluation: ${semanticEval.ai_evaluation.evaluation}`);
 
-        if (hybridEval.semantic_evaluation.numerical_accuracy !== undefined) {
+        if (semanticEval.semantic_evaluation.numerical_accuracy !== undefined) {
           console.log(
-            `🔢 Numerical Accuracy: ${hybridEval.semantic_evaluation.numerical_accuracy}`
+            `🔢 Numerical Accuracy: ${semanticEval.semantic_evaluation.numerical_accuracy}`
           );
         }
 
-        if (hybridEval.ai_evaluation.coaching) {
-          console.log(`🎓 Coaching: ${hybridEval.ai_evaluation.coaching}`);
+        if (semanticEval.ai_evaluation.coaching) {
+          console.log(`🎓 Coaching: ${semanticEval.ai_evaluation.coaching}`);
         }
 
-        console.log(`📈 Assessment: ${hybridEval.overall_assessment}`);
+        console.log(`📈 Assessment: ${semanticEval.overall_assessment}`);
 
-        // Update summary based on combined score
+        // Update summary based on semantic score
         results.summary.successful_responses++;
-        if (hybridEval.combined_score >= 8) results.summary.scores_8_to_10++;
-        else if (hybridEval.combined_score >= 6)
+        if (semanticEval.final_score >= 8) results.summary.scores_8_to_10++;
+        else if (semanticEval.final_score >= 6)
           results.summary.scores_6_to_7++;
-        else if (hybridEval.combined_score >= 4)
+        else if (semanticEval.final_score >= 4)
           results.summary.scores_4_to_5++;
         else results.summary.scores_1_to_3++;
       } else {
@@ -827,21 +813,17 @@ async function runSimpleRAGValidation() {
 
   // Calculate final summary
   const validResults = results.questions.filter(
-    (q) => q.success && q.combined_score !== undefined
+    (q) => q.success && q.final_score !== undefined
   );
-  const validCombinedScores = validResults.map((q) => q.combined_score);
-  const validAIScores = validResults.map((q) => q.ai_evaluation?.score || 0);
+  const validFinalScores = validResults.map((q) => q.final_score);
   const validSemanticScores = validResults.map(
     (q) => q.semantic_evaluation?.score || 0
   );
 
-  if (validCombinedScores.length > 0) {
-    results.summary.average_combined_score =
-      validCombinedScores.reduce((sum, score) => sum + score, 0) /
-      validCombinedScores.length;
-    results.summary.average_ai_score =
-      validAIScores.reduce((sum, score) => sum + score, 0) /
-      validAIScores.length;
+  if (validFinalScores.length > 0) {
+    results.summary.average_final_score =
+      validFinalScores.reduce((sum, score) => sum + score, 0) /
+      validFinalScores.length;
     results.summary.average_semantic_score =
       validSemanticScores.reduce((sum, score) => sum + score, 0) /
       validSemanticScores.length;
@@ -866,7 +848,7 @@ async function runSimpleRAGValidation() {
 
   // Display final results
   console.log(`\n${"=".repeat(70)}`);
-  console.log("🏆 HYBRID RAG VALIDATION RESULTS (AI + SEMANTIC ANALYSIS)");
+  console.log("🏆 SEMANTIC RAG VALIDATION RESULTS (WITH AI FEEDBACK)");
   console.log(`${"=".repeat(70)}`);
 
   console.log(`\n📊 Summary:`);
@@ -875,14 +857,11 @@ async function runSimpleRAGValidation() {
     `• Successful Responses: ${results.summary.successful_responses}`
   );
 
-  if (results.summary.average_combined_score !== undefined) {
+  if (results.summary.average_final_score !== undefined) {
     console.log(
-      `• Average Combined Score: ${results.summary.average_combined_score.toFixed(
+      `• Average Final Score: ${results.summary.average_final_score.toFixed(
         2
       )}/10`
-    );
-    console.log(
-      `• Average AI Score: ${results.summary.average_ai_score.toFixed(2)}/10`
     );
     console.log(
       `• Average Semantic Score: ${results.summary.average_semantic_score.toFixed(
@@ -910,15 +889,14 @@ async function runSimpleRAGValidation() {
 
   console.log(`\n📋 Question Results:`);
   results.questions.forEach((result, index) => {
-    if (result.success && result.combined_score !== undefined) {
-      const status = result.combined_score >= 6 ? "✅" : "⚠️";
-      const aiScore = result.ai_evaluation?.score || 0;
+    if (result.success && result.final_score !== undefined) {
+      const status = result.final_score >= 6 ? "✅" : "⚠️";
       const semanticScore = result.semantic_evaluation?.score || 0;
       const similarity = result.semantic_evaluation?.similarity || 0;
 
       console.log(
-        `${status} ${index + 1}. Combined: ${result.combined_score}/10 ` +
-          `(AI: ${aiScore}/10, Semantic: ${semanticScore}/10, Sim: ${similarity.toFixed(
+        `${status} ${index + 1}. Final: ${result.final_score}/10 ` +
+          `(Semantic: ${semanticScore}/10, Sim: ${similarity.toFixed(
             3
           )}) ` +
           `- ${result.question.question.substring(0, 50)}...`
@@ -933,11 +911,8 @@ async function runSimpleRAGValidation() {
     }
   });
 
-  // Overall grade based on combined score
-  const avgScore =
-    results.summary.average_combined_score ||
-    results.summary.average_ai_score ||
-    0;
+  // Overall grade based on final score
+  const avgScore = results.summary.average_final_score || 0;
   const overallGrade =
     avgScore >= 8
       ? "EXCELLENT"
@@ -954,7 +929,7 @@ async function runSimpleRAGValidation() {
   results.overallGrade = overallGrade;
 
   console.log(`⏱️ Execution Time: ${executionTime}ms`);
-  console.log("✅ Hybrid RAG validation completed!");
+  console.log("✅ Semantic RAG validation completed!");
 
   return results;
 }
@@ -963,7 +938,7 @@ async function runSimpleRAGValidation() {
 if (import.meta.url === `file://${process.argv[1]}`) {
   runSimpleRAGValidation()
     .then((results) => {
-      console.log("\n🎉 Hybrid RAG validation completed!");
+      console.log("\n🎉 Semantic RAG validation completed!");
 
       // Save results to logs
       const logPath = saveTestResults(

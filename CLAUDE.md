@@ -11,12 +11,14 @@ This is **upwagmitech-rag**, a Node.js-based AI educational assistant system imp
 ### Core Components
 
 **2-Stage RAG Pipeline** (`controllers/whatToAskController.js`):
+
 - **Stage 1**: Document retrieval from Pinecone vector database, initial response generation
 - **Stage 2**: Context refinement using conversation history and memory service
 - Scenario-based prompts (Role-play, Mentorship, General) loaded from external JSON config
 - Turkish language optimization with conversational keyword handling
 
 **Conversation Memory System** (`services/conversationMemoryService.js`):
+
 - WUP-806 memory fix implementation ensuring chronological message ordering
 - User profile persistence (skill level, goals, interests detection)
 - Topic continuity tracking across sessions
@@ -24,6 +26,7 @@ This is **upwagmitech-rag**, a Node.js-based AI educational assistant system imp
 - Eliminates vector similarity filtering issues that caused context loss
 
 **AWS Integration**:
+
 - DynamoDB: Conversation storage (`UpConversationMessage-{stage}`, `UpConversations-{stage}`)
 - SQS: Asynchronous processing queues
 - Lambda: Serverless function integration
@@ -41,10 +44,12 @@ POST /assistant/:assistantId/documents                              # Document u
 ### Database Schema
 
 **Conversations**: `UpConversations-{stage}`
+
 - Primary Key: `idUpdatedAt` (conversation ID)
 - Fields: `userId`, `lastMessage`, `updatedAt`, `title`
 
 **Messages**: `UpConversationMessage-{stage}`
+
 - Primary Key: `conversationId`
 - Sort Key: `createdAt` (chronological ordering)
 - Fields: `content`, `role`, `userId`, `assistantId`, `metadata`
@@ -52,18 +57,21 @@ POST /assistant/:assistantId/documents                              # Document u
 ## Common Commands
 
 ### Development
+
 ```bash
 npm run dev              # Start development server (port 3000)
 npm start               # Production start
 ```
 
 ### Testing
+
 ```bash
 npm run test:memory     # WUP-806 memory persistence tests
 npm run test:syntax     # Syntax validation for core files
 ```
 
 ### Docker Deployment
+
 ```bash
 docker build -t up-ai .
 docker run -p 3000:3000 up-ai
@@ -72,12 +80,14 @@ docker run -p 3000:3000 up-ai
 ## Key Configuration
 
 ### Environment Variables
+
 - `STAGE`: dev/uat/prod (determines DynamoDB table suffixes)
 - `PORT`: Server port (default: 3000)
 - `PINECONE_API_KEY`: Vector database access
 - `OPENAI_API_KEY`: LLM provider access
 
 ### External Configuration
+
 - RAG scenarios loaded from: `https://raw.githubusercontent.com/wagmi-upschool/mobile-texts/refs/heads/main/rag.json`
 - Scenario override mechanism via `assistantIds` arrays
 - Stage-specific instructions for different interaction types
@@ -93,9 +103,14 @@ The ConversationMemoryService implements critical fixes for conversation continu
 - **Token Budget Management**: Intelligent context truncation within LLM limits
 
 ### Memory Integration
+
 ```javascript
 const memoryService = new ConversationMemoryService(stage);
-const context = await memoryService.getConversationContext(conversationId, 30, 3000);
+const context = await memoryService.getConversationContext(
+  conversationId,
+  30,
+  3000
+);
 const promptContext = memoryService.createConversationContextPrompt(context);
 ```
 
@@ -109,8 +124,9 @@ const promptContext = memoryService.createConversationContextPrompt(context);
 ## Testing Framework
 
 Comprehensive testing for memory persistence:
+
 - Context retrieval validation
-- Topic continuity verification  
+- Topic continuity verification
 - User profile extraction tests
 - Conversation flow analysis
 - Token budget management validation
@@ -126,9 +142,14 @@ Comprehensive testing for memory persistence:
 ## AWS Deployment
 
 The system is containerized and designed for AWS cloud deployment:
+
 - Multi-stage Docker builds for optimization
 - ECR integration for container registry
 - DynamoDB for conversation persistence
 - Environment-based configuration for dev/staging/prod
+
+## Jira Tasks
+
+- When user ask for task and gives task codes such as 'WUP-831' use jira mcp to get details
 
 When working with this codebase, prioritize understanding the 2-stage RAG flow and conversation memory system, as these are the core innovations that differentiate this implementation.
