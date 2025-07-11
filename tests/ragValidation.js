@@ -607,23 +607,35 @@ async function evaluateWithAI(question, expectedAnswer, actualAnswer) {
   }
 
   const evaluationPrompt = `
-Sen bir ticari bankacılık uzmanısın. Aşağıdaki müşteri temsilcisi cevabını değerlendir:
+Sen bir ticari bankacılık uzmanı ve mevzuat denetmenisin. Aşağıdaki müşteri temsilcisi cevabını "SADECE FAKTÜEL DOĞRULUK" açısından değerlendir:
 
 MÜŞTERI SORUSU: ${question}
-BEKLENEN YANIT: ${expectedAnswer}
+BEKLENEN YANIT (Resmi Tarife): ${expectedAnswer}
 MÜŞTERI TEMSİLCİSİ CEVABI: ${actualAnswer}
 
-Değerlendirme Kriterleri:
-1. Verilen bilgi, "Ticari Müşterilerden Alınabilecek Azami Ücretler" tarifesine uygun mu?
-2. Açıklama net ve mevzuata uygun mu? (Örn: BSMV dahil mi değil mi?)
-3. Müşteriye güven veren ve açık bir dil kullanılmış mı?
-4. İlgisiz konuya sapma veya konu kayması var mı?
-5. Müşterinin seviyesine göre açıklama yapılmış mı (karmaşık terim var mı?)?
+FAKTÜEL DOĞRULUK KRİTERLERİ (WUP-832):
+1. **RAKAMSAL DOĞRULUK**: Verilen yüzdeler, tutarlar, limitler tam olarak doğru mu?
+   - Örn: "%0,25" yerine "%0,3" yazmış mı?
+   - Örn: "₺6,09" yerine "₺6,10" yazmış mı?
 
-Lütfen yanıtı 1-10 arasında puanla ve kısa bir koçluk geri bildirimi ver:
-PUAN: [1-10]
-DEĞERLENDİRME: [Kısa açıklama]
-KOÇLUK: [Gelişim önerisi]`;
+2. **MEVZUAT UYGUNLUĞU**: "Ticari Müşterilerden Alınabilecek Azami Ücretler" tarifesine birebir uyumluluk
+   - BSMV dahil/hariç bilgisi doğru mu?
+   - Azami/asgari limitler doğru mu?
+   - Vade/tutar aralıkları doğru mu?
+
+3. **SPESİFİK BİLGİ VALİDASYONU**: Özellikle kesin oranlar ve tutarlar için
+   - "6300 Lira altındaki nakit yönetimi ücreti nedir?" → "30,46 Lira"
+   - Bu tür spesifik bilgiler tam doğru verilmiş mi?
+
+4. **FAKTÜEL TUTARLILIK**: Beklenen yanıt ile gerçek yanıt arasında faktüel fark var mı?
+   - Hiçbir sayısal hata tolere edilmez
+   - Mevzuat terimlerinde kesinlik şart
+
+**ÖNEMLİ**: Bu değerlendirme SADECE faktüel doğruluğa odaklanır. Dil kalitesi, müşteri deneyimi gibi faktörler değerlendirilmez.
+
+FAKTÜEL DOĞRULUK PUANI: [1-10]
+DEĞERLENDİRME: [Sadece faktüel doğruluk açısından kısa açıklama]
+KOÇLUK: [Faktüel hatalar için düzeltme önerileri]`;
 
   try {
     const url = `${azureEndpoint}/openai/deployments/${azureDeployment}/chat/completions?api-version=${azureApiVersion}`;
@@ -655,8 +667,9 @@ KOÇLUK: [Gelişim önerisi]`;
     const data = await response.json();
     const evaluation = data.choices[0].message.content;
 
-    // Extract score, evaluation, and coaching
-    const scoreMatch = evaluation.match(/\*?\*?PUAN:\*?\*?\s*(\d+)/);
+    // Extract score, evaluation, and coaching (updated for WUP-832 prompt structure)
+    const scoreMatch = evaluation.match(/\*?\*?FAKTÜEL DOĞRULUK PUANI:\*?\*?\s*(\d+)/) || 
+                      evaluation.match(/\*?\*?PUAN:\*?\*?\s*(\d+)/);
     const evalMatch = evaluation.match(/\*?\*?DEĞERLENDİRME:\*?\*?\s*(.+?)(?=\*?\*?KOÇLUK:|$)/s);
     const coachingMatch = evaluation.match(/\*?\*?KOÇLUK:\*?\*?\s*(.+)/s);
 
