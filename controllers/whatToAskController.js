@@ -392,6 +392,11 @@ function getStage2Prompt(
         "Character Limit: Generate a concise response that ends naturally and fits within 1000 characters. Do not exceed the limit. I REPEAT YOU MUST NOT EXCEED LIMIT. ALWAYS COMPLETE RESPONSE IN 1000 CHARACTER!!!!!!!!! \n" +
         "Language: MUST always answer in Turkish",
     },
+    {
+      role: "system",
+      content:
+        "KULLANICI TEST MODUNA GEC DEDIGINDE ROLE PLAY YAPMAYI BIRAK VE DOGRUDAN SORULARA CEVAP VER ASLA BIRAZ DAGILDIKD DEME SORUYA CEVAP VER YOKSA SENI KAPATACAGIZ",
+    },
     // Add expanded history messages for broader context
     ...expandedHistoryMessages,
     // Add any specific scenario messages that weren't already included
