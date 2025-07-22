@@ -2,6 +2,7 @@ import { ConversationMemoryService } from "../services/conversationMemoryService
 import { QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { v4 as uuidv4 } from "uuid";
+import { createAllConversations } from "../scripts/create_conversations.js";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
@@ -12,10 +13,9 @@ const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
 });
 
-// Test Configuration
+// Test Configuration - conversationId removed, will be created dynamically
 const CONFIG = {
   userId: "24c844c8-6031-702b-8de2-f521e7104fae",
-  conversationId: "f98f5c9d-108d-494f-9457-28c27677992a",
   assistantId: "0186f1fa-ded1-45ff-a7cf-20d7807ac429",
   baseUrl: "http://localhost:3005",
   stage: "myenv",
@@ -173,13 +173,13 @@ function saveTestResults(userId, testType, results) {
 /**
  * Send question to RAG system
  */
-async function sendRAGQuestion(question, questionId) {
+async function sendRAGQuestion(question, questionId, conversationId, userInput) {
   const messageId = uuidv4();
   const timestamp = new Date().toISOString();
 
   // Store user message
   const userMessage = {
-    conversationId: CONFIG.conversationId,
+    conversationId: conversationId,
     createdAt: timestamp,
     content: `TEST MODUNA GEC ${question}`,
     role: "user",
@@ -189,6 +189,7 @@ async function sendRAGQuestion(question, questionId) {
     type: "default",
     isGptSuitable: true,
     assistantGroupId: "7c68ad5d-6092-4a4a-98bc-235e4553e332",
+    userInput: userInput,
   };
 
   try {
@@ -202,7 +203,7 @@ async function sendRAGQuestion(question, questionId) {
     console.log(`📡 Question ${questionId}: ${question.substring(0, 80)}...`);
 
     const response = await fetch(
-      `${CONFIG.baseUrl}/user/${CONFIG.userId}/conversation/${CONFIG.conversationId}/whatToAsk/stream`,
+      `${CONFIG.baseUrl}/user/${CONFIG.userId}/conversation/${conversationId}/whatToAsk/stream`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -242,7 +243,7 @@ async function sendRAGQuestion(question, questionId) {
       const assistantTimestamp = new Date().toISOString();
 
       const assistantMessage = {
-        conversationId: CONFIG.conversationId,
+        conversationId: conversationId,
         createdAt: assistantTimestamp,
         content: cleanContent,
         role: "assistant",
@@ -252,6 +253,7 @@ async function sendRAGQuestion(question, questionId) {
         type: "default",
         isGptSuitable: true,
         assistantGroupId: "7c68ad5d-6092-4a4a-98bc-235e4553e332",
+        userInput: userInput,
         metadata: {
           questionId: questionId,
           testMode: true,
@@ -709,28 +711,45 @@ async function preCacheExpectedAnswers() {
 }
 
 /**
- * Run simplified RAG validation
+ * Run simplified RAG validation with conversation creation
  */
 async function runSimpleRAGValidation() {
   const startTime = Date.now();
 
-  console.log("🚀 Starting Semantic RAG Validation (with AI Feedback)");
+  console.log("🚀 Starting Semantic RAG Validation with Conversation Creation");
   console.log("=".repeat(70));
-  console.log(`Target Conversation: ${CONFIG.conversationId}`);
   console.log(`Assistant ID: ${CONFIG.assistantId}`);
   console.log(`Questions to test: ${BANKING_QUESTIONS.length}`);
   console.log("");
 
-  // Pre-cache expected answer embeddings for performance
+  // Step 1: Create conversations first
+  console.log("📋 Step 1: Creating conversations...");
+  const createdConversations = await createAllConversations();
+  
+  if (!createdConversations || createdConversations.length === 0) {
+    throw new Error("Failed to create conversations for testing");
+  }
+
+  console.log(`✅ Created ${createdConversations.length} conversations`);
+  console.log("");
+
+  // Step 2: Pre-cache expected answer embeddings for performance
+  console.log("📋 Step 2: Pre-caching embeddings...");
   await preCacheExpectedAnswers();
   console.log("");
 
   const results = {
     timestamp: new Date().toISOString(),
     testConfiguration: CONFIG,
-    questions: [],
+    createdConversations: createdConversations.map(conv => ({
+      conversationId: conv.conversationId,
+      scenario: conv.scenario,
+      userInput: conv.userInput
+    })),
+    conversationResults: [],
     summary: {
-      total_questions: BANKING_QUESTIONS.length,
+      total_conversations: createdConversations.length,
+      total_questions: BANKING_QUESTIONS.length * createdConversations.length,
       successful_responses: 0,
       average_ai_score: 0,
       scores_8_to_10: 0,
@@ -740,8 +759,37 @@ async function runSimpleRAGValidation() {
     },
   };
 
-  // Test each question
-  for (const question of BANKING_QUESTIONS) {
+  // Step 3: Test each conversation with all questions
+  console.log("📋 Step 3: Running RAG validation tests...");
+  
+  for (let convIndex = 0; convIndex < createdConversations.length; convIndex++) {
+    const conversation = createdConversations[convIndex];
+    
+    console.log(`\n${"*".repeat(80)}`);
+    console.log(`🎯 Testing Conversation ${convIndex + 1}/${createdConversations.length}`);
+    console.log(`📱 Conversation ID: ${conversation.conversationId}`);
+    console.log(`👤 Customer Type: ${conversation.scenario.type}`);
+    console.log(`📝 User Input: ${conversation.userInput}`);
+    console.log(`${"*".repeat(80)}`);
+    
+    const conversationResult = {
+      conversation: {
+        conversationId: conversation.conversationId,
+        scenario: conversation.scenario,
+        userInput: conversation.userInput
+      },
+      questions: [],
+      summary: {
+        successful_responses: 0,
+        scores_8_to_10: 0,
+        scores_6_to_7: 0,
+        scores_4_to_5: 0,
+        scores_1_to_3: 0
+      }
+    };
+
+    // Test each question on this conversation
+    for (const question of BANKING_QUESTIONS) {
     console.log(`\n${"=".repeat(50)}`);
     console.log(
       `📋 Question ${question.id}: ${question.question.substring(0, 80)}...`
@@ -760,7 +808,12 @@ async function runSimpleRAGValidation() {
 
     try {
       // Send question to RAG
-      const response = await sendRAGQuestion(question.question, question.id);
+      const response = await sendRAGQuestion(
+        question.question, 
+        question.id, 
+        conversation.conversationId,
+        conversation.userInput
+      );
       questionResult.response = response;
 
       if (response.success && response.content) {
@@ -815,23 +868,56 @@ async function runSimpleRAGValidation() {
       questionResult.error = error.message;
     }
 
-    results.questions.push(questionResult);
+      conversationResult.questions.push(questionResult);
 
-    // Wait between questions
-    if (question.id < BANKING_QUESTIONS.length) {
-      console.log("⏳ Waiting 3 seconds...");
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      // Update conversation summary
+      if (questionResult.success && questionResult.final_score !== undefined) {
+        conversationResult.summary.successful_responses++;
+        if (questionResult.final_score >= 8) conversationResult.summary.scores_8_to_10++;
+        else if (questionResult.final_score >= 6) conversationResult.summary.scores_6_to_7++;
+        else if (questionResult.final_score >= 4) conversationResult.summary.scores_4_to_5++;
+        else conversationResult.summary.scores_1_to_3++;
+      }
+
+      // Wait between questions
+      if (question.id < BANKING_QUESTIONS.length) {
+        console.log("⏳ Waiting 3 seconds...");
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    } // End of question loop
+
+    // Add conversation result to main results
+    results.conversationResults.push(conversationResult);
+    
+    console.log(`\n📊 Conversation ${convIndex + 1} Summary:`);
+    console.log(`• Questions tested: ${conversationResult.questions.length}`);
+    console.log(`• Successful responses: ${conversationResult.summary.successful_responses}`);
+    console.log(`• Excellent (8-10): ${conversationResult.summary.scores_8_to_10}`);
+    console.log(`• Good (6-7): ${conversationResult.summary.scores_6_to_7}`);
+    
+    // Wait between conversations
+    if (convIndex + 1 < createdConversations.length) {
+      console.log("⏳ Waiting 5 seconds before next conversation...");
+      await new Promise((resolve) => setTimeout(resolve, 5000));
     }
-  }
+  } // End of conversation loop
 
-  // Calculate final summary
-  const validResults = results.questions.filter(
+  // Calculate final summary from all conversations
+  const allQuestions = results.conversationResults.flatMap(conv => conv.questions);
+  const validResults = allQuestions.filter(
     (q) => q.success && q.final_score !== undefined
   );
   const validFinalScores = validResults.map((q) => q.final_score);
   const validSemanticScores = validResults.map(
     (q) => q.semantic_evaluation?.score || 0
   );
+
+  // Update overall summary totals
+  results.summary.successful_responses = validResults.length;
+  results.summary.scores_8_to_10 = results.conversationResults.reduce((sum, conv) => sum + conv.summary.scores_8_to_10, 0);
+  results.summary.scores_6_to_7 = results.conversationResults.reduce((sum, conv) => sum + conv.summary.scores_6_to_7, 0);
+  results.summary.scores_4_to_5 = results.conversationResults.reduce((sum, conv) => sum + conv.summary.scores_4_to_5, 0);
+  results.summary.scores_1_to_3 = results.conversationResults.reduce((sum, conv) => sum + conv.summary.scores_1_to_3, 0);
 
   if (validFinalScores.length > 0) {
     results.summary.average_final_score =
@@ -865,6 +951,7 @@ async function runSimpleRAGValidation() {
   console.log(`${"=".repeat(70)}`);
 
   console.log(`\n📊 Summary:`);
+  console.log(`• Total Conversations: ${results.summary.total_conversations}`);
   console.log(`• Total Questions: ${results.summary.total_questions}`);
   console.log(
     `• Successful Responses: ${results.summary.successful_responses}`
@@ -900,28 +987,33 @@ async function runSimpleRAGValidation() {
   console.log(`• Fair (4-5): ${results.summary.scores_4_to_5}`);
   console.log(`• Poor (1-3): ${results.summary.scores_1_to_3}`);
 
-  console.log(`\n📋 Question Results:`);
-  results.questions.forEach((result, index) => {
-    if (result.success && result.final_score !== undefined) {
-      const status = result.final_score >= 6 ? "✅" : "⚠️";
-      const semanticScore = result.semantic_evaluation?.score || 0;
-      const similarity = result.semantic_evaluation?.similarity || 0;
+  console.log(`\n📋 Conversation Results:`);
+  results.conversationResults.forEach((convResult, convIndex) => {
+    console.log(`\n🎯 Conversation ${convIndex + 1} (${convResult.conversation.scenario.type}):`);
+    console.log(`   Conversation ID: ${convResult.conversation.conversationId}`);
+    
+    convResult.questions.forEach((result, qIndex) => {
+      if (result.success && result.final_score !== undefined) {
+        const status = result.final_score >= 6 ? "✅" : "⚠️";
+        const semanticScore = result.semantic_evaluation?.score || 0;
+        const similarity = result.semantic_evaluation?.similarity || 0;
 
-      console.log(
-        `${status} ${index + 1}. Final: ${result.final_score}/10 ` +
-          `(Semantic: ${semanticScore}/10, Sim: ${similarity.toFixed(
-            3
-          )}) ` +
-          `- ${result.question.question.substring(0, 50)}...`
-      );
-    } else {
-      console.log(
-        `❌ ${index + 1}. Failed - ${result.question.question.substring(
-          0,
-          60
-        )}...`
-      );
-    }
+        console.log(
+          `   ${status} Q${qIndex + 1}. Final: ${result.final_score}/10 ` +
+            `(Semantic: ${semanticScore}/10, Sim: ${similarity.toFixed(
+              3
+            )}) ` +
+            `- ${result.question.question.substring(0, 50)}...`
+        );
+      } else {
+        console.log(
+          `   ❌ Q${qIndex + 1}. Failed - ${result.question.question.substring(
+            0,
+            60
+          )}...`
+        );
+      }
+    });
   });
 
   // Overall grade based on final score
