@@ -1,4 +1,3 @@
-import { ConversationMemoryService } from "../services/conversationMemoryService.js";
 import { QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { v4 as uuidv4 } from "uuid";
@@ -13,15 +12,113 @@ const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
 });
 
-// Test Configuration - conversationId removed, will be created dynamically
-const CONFIG = {
-  userId: "24c844c8-6031-702b-8de2-f521e7104fae",
-  assistantId: "0186f1fa-ded1-45ff-a7cf-20d7807ac429",
-  baseUrl: "http://localhost:3005",
-  stage: "myenv",
-  maxRetries: 3,
-  retryDelay: 2000,
-};
+/**
+ * Parse command line arguments
+ */
+function parseArguments() {
+  const args = process.argv.slice(2);
+  const config = {
+    userId: "24c844c8-6031-702b-8de2-f521e7104fae",
+    assistantId: "0186f1fa-ded1-45ff-a7cf-20d7807ac429", 
+    baseUrl: "http://localhost:3005",
+    stage: "myenv",
+    maxRetries: 3,
+    retryDelay: 2000,
+    // New parameters for conversation creation
+    maxConversations: 20, // --max-count / -m
+    maxConversationsToTest: undefined, // --test-count / -t (test all by default)
+    preview: false, // --preview / -p
+    skipConversationCreation: false, // --skip-create / -s
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const nextArg = args[i + 1];
+
+    switch (arg) {
+      case '--assistant-id':
+      case '-a':
+        if (nextArg) config.assistantId = nextArg;
+        i++;
+        break;
+      case '--user-id':
+      case '-u':
+        if (nextArg) config.userId = nextArg;
+        i++;
+        break;
+      case '--stage':
+      case '-s':
+        if (nextArg) config.stage = nextArg;
+        i++;
+        break;
+      case '--max-count':
+      case '-m':
+        if (nextArg) config.maxConversations = parseInt(nextArg);
+        i++;
+        break;
+      case '--test-count':
+      case '-t':
+        if (nextArg) config.maxConversationsToTest = parseInt(nextArg);
+        i++;
+        break;
+      case '--base-url':
+      case '-b':
+        if (nextArg) config.baseUrl = nextArg;
+        i++;
+        break;
+      case '--preview':
+      case '-p':
+        config.preview = true;
+        break;
+      case '--skip-create':
+      case '--skip-creation':
+        config.skipConversationCreation = true;
+        break;
+      case '--help':
+      case '-h':
+        console.log(`
+🚀 RAG Validation System - Command Line Options
+
+USAGE:
+  node tests/ragValidation.js [options]
+
+OPTIONS:
+  -a, --assistant-id <id>     Assistant ID to test (default: 0186f1fa-ded1-45ff-a7cf-20d7807ac429)
+  -u, --user-id <id>          User ID for testing (default: 24c844c8-6031-702b-8de2-f521e7104fae)  
+  -s, --stage <stage>         DynamoDB stage (default: myenv)
+  -m, --max-count <num>       Max conversations to create (default: 20)
+  -t, --test-count <num>      Max conversations to test (default: test all created)
+  -b, --base-url <url>        RAG system base URL (default: http://localhost:3005)
+  -p, --preview               Preview mode - don't create actual conversations
+      --skip-create           Skip conversation creation, use existing conversations
+  -h, --help                  Show this help message
+
+EXAMPLES:
+  # Run with default settings
+  node tests/ragValidation.js
+
+  # Create 5 conversations and test only 2 of them
+  node tests/ragValidation.js --max-count 5 --test-count 2
+
+  # Test different assistant with custom stage
+  node tests/ragValidation.js -a 86804a79-61e4-408a-9623-2eac4b43fe97 -s dev
+
+  # Preview mode (don't create conversations)
+  node tests/ragValidation.js --preview --max-count 3
+
+  # Skip conversation creation, test existing conversations
+  node tests/ragValidation.js --skip-create --test-count 1
+        `);
+        process.exit(0);
+        break;
+    }
+  }
+
+  return config;
+}
+
+// Parse command line arguments and create CONFIG
+const CONFIG = parseArguments();
 
 // Embedding cache for expected answers (they don't change)
 const EMBEDDING_CACHE = new Map();
@@ -722,9 +819,37 @@ async function runSimpleRAGValidation() {
   console.log(`Questions to test: ${BANKING_QUESTIONS.length}`);
   console.log("");
 
-  // Step 1: Create conversations first
-  console.log("📋 Step 1: Creating conversations...");
-  const createdConversations = await createAllConversations();
+  // Step 1: Create conversations first (if not skipped)
+  let createdConversations = [];
+  
+  if (CONFIG.skipConversationCreation) {
+    console.log("📋 Step 1: Skipping conversation creation (using existing conversations)");
+    console.log("⚠️  WARNING: This assumes conversations already exist for testing");
+    // For now, we'll create a placeholder - in real implementation you'd query existing conversations
+    createdConversations = [{
+      conversationId: `existing-conversation-${Date.now()}`,
+      scenario: { type: "existing", title: "Existing conversation" },
+      userInput: "Existing conversation for testing",
+      existing: true
+    }];
+  } else {
+    console.log("📋 Step 1: Creating conversations...");
+    const options = {
+      maxCount: CONFIG.maxConversations,
+      stage: CONFIG.stage,
+      userId: CONFIG.userId,
+      preview: CONFIG.preview
+    };
+    
+    console.log(`📊 Conversation creation options:`);
+    console.log(`   • Max conversations: ${options.maxCount}`);
+    console.log(`   • Stage: ${options.stage}`);
+    console.log(`   • User ID: ${options.userId}`);
+    console.log(`   • Preview mode: ${options.preview}`);
+    console.log("");
+    
+    createdConversations = await createAllConversations(CONFIG.assistantId, options);
+  }
   
   if (!createdConversations || createdConversations.length === 0) {
     throw new Error("Failed to create conversations for testing");
@@ -732,6 +857,16 @@ async function runSimpleRAGValidation() {
 
   console.log(`✅ Created ${createdConversations.length} conversations`);
   console.log("");
+
+  // Apply test count limit if specified
+  const conversationsToTest = CONFIG.maxConversationsToTest 
+    ? createdConversations.slice(0, CONFIG.maxConversationsToTest)
+    : createdConversations;
+    
+  if (CONFIG.maxConversationsToTest && conversationsToTest.length < createdConversations.length) {
+    console.log(`🎯 Testing only ${conversationsToTest.length} out of ${createdConversations.length} created conversations`);
+    console.log("");
+  }
 
   // Step 2: Pre-cache expected answer embeddings for performance
   console.log("📋 Step 2: Pre-caching embeddings...");
@@ -748,8 +883,8 @@ async function runSimpleRAGValidation() {
     })),
     conversationResults: [],
     summary: {
-      total_conversations: createdConversations.length,
-      total_questions: BANKING_QUESTIONS.length * createdConversations.length,
+      total_conversations: conversationsToTest.length,
+      total_questions: BANKING_QUESTIONS.length * conversationsToTest.length,
       successful_responses: 0,
       average_ai_score: 0,
       scores_8_to_10: 0,
@@ -762,11 +897,11 @@ async function runSimpleRAGValidation() {
   // Step 3: Test each conversation with all questions
   console.log("📋 Step 3: Running RAG validation tests...");
   
-  for (let convIndex = 0; convIndex < createdConversations.length; convIndex++) {
-    const conversation = createdConversations[convIndex];
+  for (let convIndex = 0; convIndex < conversationsToTest.length; convIndex++) {
+    const conversation = conversationsToTest[convIndex];
     
     console.log(`\n${"*".repeat(80)}`);
-    console.log(`🎯 Testing Conversation ${convIndex + 1}/${createdConversations.length}`);
+    console.log(`🎯 Testing Conversation ${convIndex + 1}/${conversationsToTest.length}`);
     console.log(`📱 Conversation ID: ${conversation.conversationId}`);
     console.log(`👤 Customer Type: ${conversation.scenario.type}`);
     console.log(`📝 User Input: ${conversation.userInput}`);
@@ -896,7 +1031,7 @@ async function runSimpleRAGValidation() {
     console.log(`• Good (6-7): ${conversationResult.summary.scores_6_to_7}`);
     
     // Wait between conversations
-    if (convIndex + 1 < createdConversations.length) {
+    if (convIndex + 1 < conversationsToTest.length) {
       console.log("⏳ Waiting 5 seconds before next conversation...");
       await new Promise((resolve) => setTimeout(resolve, 5000));
     }
