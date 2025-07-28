@@ -122,23 +122,119 @@ async function fetchUserGroupAssistants() {
 }
 
 /**
- * Prepares assistant data for vectorization
+ * Enhanced agent data mapping with Turkish categories and keywords
+ */
+const enhancedAgentData = {
+    "97729d8e-b722-4822-9490-a900cec81260": {
+        category: "İletişim Becerileri",
+        keywords: ["etkin dinleme", "aktif dinleme", "iletişim", "kişilerarası beceriler", "dinleme pratiği", "yumuşak beceriler"]
+    },
+    "5a0d25d3-d483-41ca-8551-9e83f47e0f7a": {
+        category: "İletişim Becerileri",
+        keywords: ["geri bildirim", "geribildirim", "iletişim", "pratik", "iş yeri becerileri", "yapıcı eleştiri"]
+    },
+    "4edebe53-5663-4e36-bb73-4b5696c168ca": {
+        category: "Kariyer Gelişimi",
+        keywords: ["performans değerlendirme", "performans görüşmesi", "kariyer koçluğu", "görüşme hazırlığı", "profesyonel gelişim"]
+    },
+    "a52ac10b-9771-4276-b320-ef0bf677d470": {
+        category: "İletişim Becerileri",
+        keywords: ["soru sorma", "soru becerileri", "iletişim", "koçluk", "etkili sorular", "etkileşim"]
+    },
+    "ca33604c-0e0f-4130-b16e-e05676f63976": {
+        category: "Verimlilik",
+        keywords: ["öncelik belirleme", "öncelik ayarlama", "zaman yönetimi", "günlük planlama", "verimlilik", "görev yönetimi"]
+    },
+    "cef94e12-d507-4421-818c-9c9b72aae4df": {
+        category: "Teknik Eğitim",
+        keywords: ["SQL", "veritabanı", "öğrenme", "programlama", "teknik beceriler", "adım adım", "eğitim"]
+    },
+    "d80184f3-876b-4701-87e7-ad374418eb15": {
+        category: "Mentorluk",
+        keywords: ["mentorluk", "rehberlik", "koçluk", "profesyonel gelişim", "kariyer desteği", "öğrenme"]
+    },
+    "4b88c4d7-f88d-471f-b5e5-7f52d137cace": {
+        category: "Not Alma",
+        keywords: ["not alma", "not tutma", "özet", "etkinlik notları", "konferans", "dokümantasyon"]
+    },
+    "7f0ee92d-dd52-4c5b-9b80-cbbadb9cd98c": {
+        category: "Teknik Eğitim",
+        keywords: ["SQL", "veritabanı", "öğrenme", "programlama", "teknik beceriler", "adım adım", "eğitim"]
+    },
+    "8cecea10-07e7-4572-9053-bd443091ef28": {
+        category: "Kişisel Sağlık",
+        keywords: ["mutluluk", "sevinç", "minnettarlık", "pozitif düşünce", "refah", "günlük", "farkındalık"]
+    },
+    "6c1405f9-9966-4d16-b9b3-06bdd62e4fd6": {
+        category: "Kariyer Gelişimi",
+        keywords: ["mülakat", "iş görüşmesi", "iş başvuru hazırlığı", "kariyer gelişimi", "mülakat becerileri", "iş arama"]
+    },
+    "cc6f56e5-35dd-4638-980b-2d24bb04f875": {
+        category: "Kişisel Sağlık",
+        keywords: ["meditasyon", "derin düşünce", "farkındalık", "ruh sağlığı", "stres atma", "sağlık", "zihin pratiği"]
+    },
+    "ddb044ed-f39a-4d07-a3dc-230ccb6c4751": {
+        category: "Kişisel Gelişim",
+        keywords: ["alışkanlık", "alışkanlık oluşturma", "kendini geliştirme", "kişisel büyüme", "hedef belirleme", "davranış değişikliği"]
+    },
+    "848a0a46-1bc3-42bf-8aa1-f5fe672907bc": {
+        category: "Yaşam Planlaması",
+        keywords: ["yıl sonu değerlendirme", "yıl değerlendirmesi", "planlama", "hedef belirleme", "düşünme", "yeni yıl planlaması"]
+    },
+    "4ded3a5e-1437-4d9d-a0e7-f43cf4a42c68": {
+        category: "Verimlilik",
+        keywords: ["zaman yönetimi", "zaman kontrolü", "enerji yönetimi", "verimlilik", "etkinlik", "iş-yaşam dengesi"]
+    },
+    "d63e9a3b-a6f3-4a54-a707-615119a6ffb9": {
+        category: "Öğrenme ve Eğitim",
+        keywords: ["kitap okuma", "okuma", "öğrenme", "eğitim", "bilgi", "kişisel büyüme", "alışkanlık oluşturma"]
+    },
+    "3c5ecfa4-58fe-493a-b308-472ac39cceec": {
+        category: "Satış Eğitimi",
+        keywords: ["satış", "satış eğitimi", "satış antrenmanı", "pratik", "iletişim", "iş becerileri", "müşteri ilişkileri"]
+    },
+    "0777e23c-c4f7-4cd2-88cf-3f5136eee9b2": {
+        category: "Verimlilik",
+        keywords: ["öncelik belirleme", "öncelik ayarlama", "sabah rutini", "verimlilik", "planlama", "günlük yönetim"]
+    },
+    "038c9287-3d3e-41c9-96d4-d8544381d35a": {
+        category: "Kişisel Gelişim",
+        keywords: ["büyüme zihniyeti", "gelişim odaklı düşünce", "kişisel gelişim", "öğrenme zihniyeti", "eğitim hazırlığı"]
+    },
+    "cdbee26a-38cc-4d7f-b6b5-684e12e82764": {
+        category: "Not Alma",
+        keywords: ["hafıza", "bellek", "not alma", "özet", "belgeleme", "öğrenme desteği", "çalışma yardımı"]
+    },
+    "2358d468-0c96-4fed-9639-ab3b0c4637b0": {
+        category: "Profesyonel Gelişim",
+        keywords: ["profesyonel gelişim", "mesleki gelişim", "kariyer büyümesi", "öğrenme", "beceri geliştirme", "kariyer planlama"]
+    },
+    "d0cf1ea7-c191-4a5b-be2a-c45772af88e2": {
+        category: "Kişisel Gelişim",
+        keywords: ["günlük konuşma", "günlük sohbet", "kişisel büyüme", "gelişim", "koçluk", "sürekli öğrenme"]
+    }
+};
+
+/**
+ * Prepares assistant data for vectorization with enhanced categories and keywords
  * Combines critical fields into searchable content
  */
 function prepareAssistantForIndexing(assistant, userGroups = []) {
-    // Create searchable content combining key fields
+    // Get enhanced data for this assistant
+    const enhancedData = enhancedAgentData[assistant.id] || {};
+    
+    // Create searchable content combining key fields with enhanced keywords
     const searchableContent = [
         assistant.name || '',
         assistant.description || '',
         assistant.title || '',
-        // Extract keywords from prompt if exists
-        extractKeywordsFromPrompt(assistant.prompt || ''),
-        // Add category/type information if available
-        assistant.type || '',
-        assistant.category || ''
+        // Use enhanced keywords only
+        enhancedData.keywords ? enhancedData.keywords.join(' ') : '',
+        // Use enhanced category if available, otherwise fallback to existing
+        enhancedData.category || assistant.type || assistant.category || ''
     ].filter(content => content.trim().length > 0).join(' ');
     
-    // Prepare metadata with CRITICAL environment and userGroup filtering
+    // Prepare metadata with CRITICAL environment and userGroup filtering + enhanced data
     const metadata = {
         assistantId: assistant.id,
         name: assistant.name || '',
@@ -150,7 +246,8 @@ function prepareAssistantForIndexing(assistant, userGroups = []) {
         createdAt: assistant.createdAt || '',
         updatedAt: assistant.updatedAt || '',
         type: assistant.type || '',
-        category: assistant.category || '',
+        category: enhancedData.category || assistant.category || '', // Enhanced category
+        keywords: enhancedData.keywords || [], // Enhanced keywords array
         src: assistant.src || '', // Image URL
         temperature: assistant.temperature || '',
         maxTokens: assistant.maxTokens || '',
@@ -163,50 +260,6 @@ function prepareAssistantForIndexing(assistant, userGroups = []) {
     };
 }
 
-/**
- * Extracts relevant keywords from assistant prompt
- * Simplified approach for Turkish content - focus on name and description
- */
-function extractKeywordsFromPrompt(prompt) {
-    if (!prompt || typeof prompt !== 'string') return '';
-    
-    // Simple cleaning - just remove obvious instruction markers
-    let cleanedPrompt = prompt
-        // Remove the ]***] title blocks
-        .replace(/\]?\*\*\*\]?[^]*?\]\*\*\*\]/g, '')
-        // Remove [**:] instruction blocks more carefully
-        .replace(/\[\*\*:\][^[]*?\[\*\*::\]/g, '')
-        // Remove [[instructions]] style blocks
-        .replace(/\[\[[^\]]*\]\]/g, '')
-        // Remove [BLANK] placeholders
-        .replace(/\[BLANK\]/g, '')
-        // Clean up extra whitespace and newlines
-        .replace(/\s+/g, ' ')
-        .trim()
-        .toLowerCase();
-    
-    // Turkish stopwords (keep it minimal)
-    const turkishStopwords = new Set([
-        'bir', 'bu', 'şu', 'o', 've', 'ile', 'için', 'gibi', 'kadar', 
-        'de', 'da', 'te', 'ta', 'nin', 'nın', 'nun', 'nün',
-        'olan', 'olarak', 'var', 'yok', 'hem', 'ama', 'fakat',
-        'ben', 'sen', 'biz', 'siz', 'onlar',
-        'system', 'message', 'instructions', 'please', 'user', 'turkish'
-    ]);
-    
-    // Simple word extraction
-    const words = cleanedPrompt
-        .split(/[\s.,!?;:\n\r"'"„"«»‹›\-–—]+/)
-        .filter(word => {
-            return word.length > 2 && 
-                   !turkishStopwords.has(word) &&
-                   /[a-zA-ZğüşıöçĞÜŞİÖÇ]/.test(word) && // Contains Turkish letters
-                   word.length < 25;
-        })
-        .slice(0, 10); // Limit to 10 meaningful words
-    
-    return words.join(' ');
-}
 
 /**
  * Generates embeddings for assistant content using OpenAI
@@ -321,13 +374,13 @@ async function saveAssistantsToJSON(assistants, assistantToGroups) {
             // Environment isolation
             environment: STAGE,
             
-            // Search optimization
-            extractedKeywords: extractKeywordsFromPrompt(assistant.prompt || ''),
+            // Search optimization - use enhanced keywords only
+            extractedKeywords: enhancedAgentData[assistant.id]?.keywords?.join(' ') || '',
             searchableContent: [
                 assistant.name || '',
                 assistant.description || '',
                 assistant.title || '',
-                extractKeywordsFromPrompt(assistant.prompt || ''),
+                enhancedAgentData[assistant.id]?.keywords?.join(' ') || '',
                 assistant.type || '',
                 assistant.category || ''
             ].filter(content => content.trim().length > 0).join(' ').substring(0, 300)
