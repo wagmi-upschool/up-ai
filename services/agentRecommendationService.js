@@ -101,20 +101,29 @@ export class AgentRecommendationService {
   /**
    * Perform similarity search in Pinecone
    */
-  async performSimilaritySearch(queryEmbedding, topK = 10) {
+  async performSimilaritySearch(queryEmbedding, topK = 10, userGroup = null) {
     try {
       const index = this.pinecone.index(this.indexName);
       
-      console.log(`🔍 Performing similarity search in ${this.indexName} (topK: ${topK})`);
+      console.log(`🔍 Performing similarity search in ${this.indexName} (topK: ${topK})${userGroup ? ` (userGroup: ${userGroup})` : ''}`);
+      
+      // Build filter object with environment and optional userGroup
+      const filter = {
+        environment: this.stage, // Filter by environment for data isolation
+      };
+      
+      // Add userGroup filtering if provided
+      if (userGroup) {
+        filter.userGroups = { "$in": [userGroup] }; // Filter by userGroup array
+        console.log(`🎯 Filtering by userGroup: ${userGroup}`);
+      }
       
       const queryRequest = {
         vector: queryEmbedding,
         topK: topK,
         includeMetadata: true,
         includeValues: false,
-        filter: {
-          environment: this.stage, // Filter by environment for data isolation
-        },
+        filter: filter,
       };
       
       const searchResults = await index.query(queryRequest);
@@ -326,17 +335,17 @@ export class AgentRecommendationService {
   /**
    * Main method to get agent recommendations
    */
-  async getRecommendations(query) {
+  async getRecommendations(query, userGroup = null) {
     const startTime = Date.now();
     
     try {
-      console.log(`🚀 Starting agent recommendation for query: "${query}"`);
+      console.log(`🚀 Starting agent recommendation for query: "${query}"${userGroup ? ` (userGroup: ${userGroup})` : ''}`);
       
       // Step 1: Generate query embedding
       const queryEmbedding = await this.generateQueryEmbedding(query);
       
-      // Step 2: Perform similarity search
-      const matches = await this.performSimilaritySearch(queryEmbedding);
+      // Step 2: Perform similarity search with userGroup filtering
+      const matches = await this.performSimilaritySearch(queryEmbedding, 10, userGroup);
       
       // Step 3: Always return top 3 agents regardless of similarity threshold
       const topMatches = this.getTop3Agents(matches);

@@ -100,8 +100,8 @@ export async function handleAgentRecommendation(req, res) {
   const startTime = Date.now();
   
   try {
-    // Extract query from request body
-    const { query } = req.body;
+    // Extract query and userGroup from request body
+    const { query, userGroup } = req.body;
     
     // Validate request payload
     if (!query) {
@@ -130,8 +130,8 @@ export async function handleAgentRecommendation(req, res) {
       ip: req.ip,
     });
     
-    // Get recommendations from service
-    const recommendations = await recommendationService.getRecommendations(query);
+    // Get recommendations from service with userGroup filtering
+    const recommendations = await recommendationService.getRecommendations(query, userGroup);
     
     // Calculate response time
     const responseTime = Date.now() - startTime;
