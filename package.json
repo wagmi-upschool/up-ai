@@ -8,7 +8,14 @@
     "start": "node app.js",
     "dev": "node app.js",
     "test:memory": "node tests/memoryPersistenceTest.js",
-    "test:syntax": "node --check controllers/whatToAskController.js && node --check services/conversationMemoryService.js"
+    "test:syntax": "node --check controllers/whatToAskController.js && node --check services/conversationMemoryService.js",
+    "test:agents": "node runAgentTests.js",
+    "test:agents:quick": "node runAgentTests.js --quick",
+    "test:agents:technical": "node runAgentTests.js --categories technical",
+    "test:agents:communication": "node runAgentTests.js --categories communicationSkills",
+    "test:agents:productivity": "node runAgentTests.js --categories productivity",
+    "test:agents:limited": "node runAgentTests.js --max 20",
+    "test:agents:prod": "STAGE=upwagmitec node runAgentTests.js"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.682.0",

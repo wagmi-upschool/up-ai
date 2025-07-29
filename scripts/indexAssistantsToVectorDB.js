@@ -223,16 +223,28 @@ function prepareAssistantForIndexing(assistant, userGroups = []) {
     // Get enhanced data for this assistant
     const enhancedData = enhancedAgentData[assistant.id] || {};
     
-    // Create searchable content combining key fields with enhanced keywords
+    // Create searchable content with KEYWORD AMPLIFICATION for better matching
+    // CRITICAL: Amplify keywords to dominate the embedding vector and reduce dilution
+    const name = assistant.name || '';
+    const description = assistant.description || '';
+    const keywords = enhancedData.keywords || [];
+    const category = enhancedData.category || '';
+    
+    // AGGRESSIVE keyword amplification: repeat each keyword 5 times for maximum weight
+    const amplifiedKeywords = keywords.length > 0 
+        ? keywords.concat(keywords).concat(keywords).concat(keywords).concat(keywords).join(' ')
+        : '';
+    
+    // FOCUSED content structure: Name repeated + Massive keyword amplification only
+    // CRITICAL: Convert everything to lowercase for consistent matching
     const searchableContent = [
-        assistant.name || '',
-        assistant.description || '',
-        assistant.title || '',
-        // Use enhanced keywords only
-        enhancedData.keywords ? enhancedData.keywords.join(' ') : '',
-        // Use enhanced category if available, otherwise fallback to existing
-        enhancedData.category || assistant.type || assistant.category || ''
-    ].filter(content => content.trim().length > 0).join(' ');
+        name + ' ' + name,       // Agent name repeated twice (highest importance)
+        amplifiedKeywords,       // Keywords repeated 5x (maximum importance) 
+        category                 // Category only (no diluting description)
+    ].filter(content => content.trim().length > 0).join(' ').toLowerCase();
+    
+    console.log(`📝 Amplified content for ${assistant.name}: "${searchableContent.substring(0, 150)}..."`);
+    console.log(`🔑 Keywords repeated 5x: ${keywords.join(', ')}`)
     
     // Prepare metadata with CRITICAL environment and userGroup filtering + enhanced data
     const metadata = {
