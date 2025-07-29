@@ -18,7 +18,7 @@ export class AgentRecommendationService {
   constructor(stage = process.env.STAGE || "myenv") {
     this.stage = stage;
     this.indexName = "assistant-recommend";
-    this.minSimilarityThreshold = 0.7; // Minimum relevance score
+    this.minSimilarityThreshold = 0.45; // Minimum relevance score
     this.maxResults = 3; // Top 3 recommendations
     
     // Initialize Pinecone client
