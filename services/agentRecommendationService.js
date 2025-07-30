@@ -205,14 +205,22 @@ export class AgentRecommendationService {
     const recommendations = matches.map(match => {
       const metadata = match.metadata || {};
       
+      
       return {
         agentId: metadata.assistantId || match.id?.replace(`${this.stage}_`, ''),
         name: metadata.name || 'Unknown Agent',
         description: metadata.description || 'No description available',
-        category: metadata.category || 'General',
-        keywords: metadata.keywords || [],
+        category: metadata.category || 'General', // Full category (e.g., "İletişim Becerileri > Aktif Dinleme")
+        mainCategory: metadata.mainCategory || 'General', // Main category
+        subCategory: metadata.subCategory || '', // Sub category
+        semanticCluster: metadata.semanticCluster || '', // Semantic cluster
+        extractedKeywords: metadata.extractedKeywords || '', // Extracted keywords string
+        keywords: metadata.extractedKeywords ? metadata.extractedKeywords.split(' ').filter(k => k.trim().length > 0) : [], // Keywords array
         relevanceScore: Math.round(match.score * 100) / 100, // Round to 2 decimal places
         environment: metadata.environment || this.stage,
+        userGroups: metadata.userGroups || [], // User groups for this agent
+        type: metadata.type || '', // Agent type
+        src: metadata.src || '', // Image URL
       };
     });
     
