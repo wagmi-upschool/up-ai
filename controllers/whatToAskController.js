@@ -13,6 +13,7 @@ import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { v4 as uuidv4 } from "uuid";
 import { extractSqlLevel } from "../utils/levelExtractor.js";
 import { ConversationMemoryService } from "../services/conversationMemoryService.js";
+import { AssistantInputOptionsService } from "../services/assistantInputOptionsService.js";
 import dotenv from "dotenv";
 
 // Load environment variables from .env file
@@ -29,6 +30,10 @@ const lambdaClient = new LambdaClient({
 
 const sqsClient = new SQSClient({
   region: "us-east-1",
+});
+
+const assistantInputOptionsService = new AssistantInputOptionsService({
+  stage: process.env.STAGE,
 });
 
 // SQS Queue URLs - Use environment variables from ECS task definition
@@ -132,6 +137,7 @@ function createAssistantRetriever({
   index_assistant_documents,
   assistantId,
   level,
+  topic,
 }) {
   const filters = [
     {
@@ -148,6 +154,15 @@ function createAssistantRetriever({
       operator: "==",
     });
     console.log(`Filtering assistant documents by level: ${level}`);
+  }
+
+  if (topic) {
+    filters.push({
+      key: "topic",
+      value: topic,
+      operator: "==",
+    });
+    console.log(`Filtering assistant documents by topic: ${topic}`);
   }
 
   return new VectorIndexRetriever({
@@ -955,6 +970,55 @@ export async function handleWhatToAskController(req, res) {
       dataSource: conversationContext.metadata.dataSource, // Track which source was used
     });
 
+    // Detect topic from first user message via assistant input options
+    const priorUserMessages =
+      (conversationContext.messages || []).filter(
+        (msg) => msg.role === "user"
+      ).length;
+    const isFirstUserMessage = priorUserMessages === 0;
+    let detectedTopic = null;
+
+    if (isFirstUserMessage && query) {
+      try {
+        const normalizedQuery = query
+          .toString()
+          .toLocaleLowerCase("tr")
+          .trim();
+        const optionsService =
+          stage && stage !== process.env.STAGE
+            ? new AssistantInputOptionsService({ stage })
+            : assistantInputOptionsService;
+        const options = await optionsService.getAllOptions(assistantId);
+        const normalizedOptions = options
+          .map((opt) => {
+            const raw =
+              (opt.value || opt.text || opt.SK || "").toString().trim();
+            return {
+              raw,
+              normalized: raw.toLocaleLowerCase("tr"),
+            };
+          })
+          .filter((opt) => opt.normalized.length > 0);
+
+        const matched = normalizedOptions.find((opt) =>
+          normalizedQuery.includes(opt.normalized)
+        );
+
+        if (matched) {
+          detectedTopic = matched.raw;
+          console.log(
+            `First user message matched input option for topic filter: ${detectedTopic}`
+          );
+        } else {
+          console.log(
+            "First user message did not match any input option; no topic filter applied."
+          );
+        }
+      } catch (error) {
+        console.error("Error detecting topic from input options:", error);
+      }
+    }
+
     // Fetch user analytics for personalization - use userId instead of conversationId
     console.log("Fetching user analytics for personalization...");
     const analyticsData = await fetchUserAnalytics(userId, stage);
@@ -1156,6 +1220,7 @@ export async function handleWhatToAskController(req, res) {
       index_assistant_documents,
       assistantId,
       level, // Pass the extracted level
+      topic: detectedTopic, // Apply topic filter only when matched on first user message
     });
 
     let assistantDocs = await retriever_assistant.retrieve(contextAwareQuery);

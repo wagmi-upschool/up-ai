@@ -514,7 +514,8 @@ async function logDocumentsToJSON(documents, type, assistantId) {
  */
 export async function handleAddDocumentsToAssistantDocuments(req, res) {
   const { assistantId } = req.params;
-  const { text, url, isHardSkill, hardSkillMetadata } = req.body;
+  const { text, url, isHardSkill, hardSkillMetadata, additionalMetadata } =
+    req.body;
 
   console.log(`Processing request for assistantId: ${assistantId}`);
   console.log(`Input type: ${url ? "PDF URL" : "text"}`);
@@ -527,7 +528,16 @@ export async function handleAddDocumentsToAssistantDocuments(req, res) {
     let logFilePath = null;
     let documentSourceType = url ? "pdf" : "text";
 
+    // Allow callers to attach arbitrary metadata (e.g., topic) to each chunk
+    const extraMetadata =
+      additionalMetadata &&
+      typeof additionalMetadata === "object" &&
+      !Array.isArray(additionalMetadata)
+        ? additionalMetadata
+        : {};
+
     const baseMetadata = {
+      ...extraMetadata, // user-provided metadata should not override system-set fields below
       source: "assistant-documents",
       assistantId: assistantId,
       sourceType: documentSourceType,
