@@ -10,12 +10,17 @@ import {
 } from "llamaindex";
 import { GetCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { AssistantInputOptionsService } from "../services/assistantInputOptionsService.js";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const dynamoDbClient = new DynamoDBClient({
   region: "us-east-1",
+});
+
+const assistantInputOptionsService = new AssistantInputOptionsService({
+  stage: process.env.STAGE,
 });
 
 // Helper function for timing measurements
@@ -46,6 +51,29 @@ function getAzureEmbeddingOptions() {
     deployment: "text-embedding-3-small",
     apiKey: process.env.AZURE_OPENAI_KEY,
   };
+}
+
+function logRetrieverSamples(results, label = "results", maxItems = 3) {
+  try {
+    results.slice(0, maxItems).forEach((doc, idx) => {
+      const textPreview = (doc?.node?.text || "").replace(/\s+/g, " ");
+      const trimmedText =
+        textPreview.length > 120
+          ? `${textPreview.substring(0, 120)}...`
+          : textPreview;
+      console.log(
+        `[${label} ${idx}] score=${(doc?.score || 0).toFixed(
+          3
+        )} metadata=${JSON.stringify(doc?.node?.metadata || {})} text="${trimmedText}"`
+      );
+      console.log(
+        `[${label} ${idx} metadata obj]:`,
+        doc?.node?.metadata || {}
+      );
+    });
+  } catch (err) {
+    console.error("Error logging retriever samples:", err);
+  }
 }
 
 async function initializeSettings(config) {
@@ -98,18 +126,33 @@ async function createIndices() {
   return { index_chat_messages, index_assistant_documents };
 }
 
-function createAssistantRetriever({ index_assistant_documents, assistantId }) {
+function createAssistantRetriever({
+  index_assistant_documents,
+  assistantId,
+  topic,
+}) {
+  const filters = [
+    {
+      key: "assistantId",
+      value: assistantId,
+      operator: "==",
+    },
+  ];
+
+  if (topic) {
+    filters.push({
+      key: "topic",
+      value: topic,
+      operator: "==",
+    });
+    console.log(`Filtering assistant documents by topic: ${topic}`);
+  }
+
   return new VectorIndexRetriever({
     index: index_assistant_documents,
     includeValues: true,
     filters: {
-      filters: [
-        {
-          key: "assistantId",
-          value: assistantId,
-          operator: "==",
-        },
-      ],
+      filters,
     },
     similarityTopK: 100,
   });
@@ -212,14 +255,82 @@ export async function handleLLMStream(req, res) {
     const { index_chat_messages, index_assistant_documents } =
       await createIndices();
 
+    // Detect topic from first user message (only when no prior user messages)
+    const normalizedConversationId =
+      conversationId &&
+      conversationId !== "null" &&
+      conversationId !== "undefined"
+        ? conversationId
+        : null;
+    let priorUserMessages = 0;
+    if (normalizedConversationId) {
+      try {
+        const chatHistoryRetriever = createChatRetriever({
+          index_chat_messages,
+          conversationId: normalizedConversationId,
+        });
+        const historyNodes = await chatHistoryRetriever.retrieve(
+          "conversation history context"
+        );
+        priorUserMessages = historyNodes.filter(
+          (n) => (n?.node?.metadata?.role || "").toLowerCase() === "user"
+        ).length;
+      } catch (err) {
+        console.warn(
+          "Could not determine prior user messages, assuming not first message:",
+          err?.message
+        );
+        priorUserMessages = 1; // avoid applying topic filter on uncertainty
+      }
+    }
+    const isFirstUserMessage = priorUserMessages === 0;
+    let detectedTopic = null;
+
+    if (isFirstUserMessage && query) {
+      try {
+        const normalizedQuery = query.toString().toLocaleLowerCase("tr").trim();
+        const service =
+          stage && stage !== process.env.STAGE
+            ? new AssistantInputOptionsService({ stage })
+            : assistantInputOptionsService;
+        const options = await service.getAllOptions(assistantId);
+        const normalizedOptions = options
+          .map((opt) => {
+            const raw =
+              (opt.value || opt.text || opt.SK || "").toString().trim();
+            return {
+              raw,
+              normalized: raw.toLocaleLowerCase("tr"),
+            };
+          })
+          .filter((opt) => opt.normalized.length > 0);
+
+        const matched = normalizedOptions.find((opt) =>
+          normalizedQuery.includes(opt.normalized)
+        );
+        if (matched) {
+          detectedTopic = matched.raw;
+          console.log(
+            `First user message matched input option for topic filter: ${detectedTopic}`
+          );
+        } else {
+          console.log(
+            "First user message did not match any input option; no topic filter applied."
+          );
+        }
+      } catch (err) {
+        console.error("Error detecting topic from input options:", err);
+      }
+    }
+
     let retrievers = [];
     let response;
 
     // Add chat retriever if we have a conversation ID
-    if (conversationId) {
+    if (normalizedConversationId) {
       const retriever_chat = createChatRetriever({
         index_chat_messages,
-        conversationId,
+        conversationId: normalizedConversationId,
       });
       retrievers.push(retriever_chat);
     }
@@ -229,6 +340,7 @@ export async function handleLLMStream(req, res) {
       const retriever_assistant = createAssistantRetriever({
         index_assistant_documents,
         assistantId,
+        topic: detectedTopic,
       });
       retrievers.push(retriever_assistant);
     }
@@ -238,7 +350,24 @@ export async function handleLLMStream(req, res) {
 
     // Get results from all retrievers
     const results = await combinedRetriever.retrieve(query);
-    console.log("Retrieved results:", results);
+    console.log("Retrieved results (raw):", results);
+    try {
+      const formatted = results.slice(0, 5).map((doc) => ({
+        score: doc?.score || 0,
+        metadata: doc?.node?.metadata || {},
+        text:
+          (doc?.node?.text || "").length > 200
+            ? `${doc.node.text.substring(0, 200)}...`
+            : doc?.node?.text || "",
+      }));
+      console.log(
+        "Retrieved results (formatted metadata):",
+        JSON.stringify(formatted, null, 2)
+      );
+    } catch (err) {
+      console.error("Error formatting retrieved results:", err);
+    }
+    logRetrieverSamples(results, "retrieverResults", 5);
 
     if (!conversationId || conversationId === "null" || results.length === 0) {
       console.log("Using direct LLM response");

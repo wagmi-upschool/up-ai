@@ -196,6 +196,26 @@ function filterByScore(results, minScore = 0.25) {
   return results.filter((result) => (result.score || 0) > minScore);
 }
 
+function logAssistantDocSamples(docs, label = "assistantDocs", maxItems = 3) {
+  try {
+    docs.slice(0, maxItems).forEach((doc, idx) => {
+      const textPreview = (doc?.node?.text || "").replace(/\s+/g, " ");
+      const trimmedText =
+        textPreview.length > 120
+          ? `${textPreview.substring(0, 120)}...`
+          : textPreview;
+      console.log(
+        `[${label} ${idx}] score=${(doc?.score || 0).toFixed(
+          3
+        )} metadata=${JSON.stringify(doc?.node?.metadata || {})} text="${trimmedText}"`
+      );
+      console.log(`[${label} ${idx} metadata obj]`, doc?.node?.metadata || {});
+    });
+  } catch (err) {
+    console.error("Error logging assistant doc samples:", err);
+  }
+}
+
 // Enhanced query function that includes conversation context
 function createContextAwareQuery(userQuery, conversationContext) {
   if (!conversationContext || !conversationContext.context) {
@@ -1233,6 +1253,7 @@ export async function handleWhatToAskController(req, res) {
     const assistantDocsMinScore = scenarioType.includes("SQL") ? 0.65 : 0.2; // Reduced thresholds for all SQL variants
     assistantDocs = filterByScore(assistantDocs, assistantDocsMinScore);
     console.log("Stage 1: Filtered assistantDocs count:", assistantDocs.length);
+    logAssistantDocSamples(assistantDocs, "assistantDocs", 5);
 
     // WUP-806 FIX: Pass conversation context to Stage 1 prompt
     const stage1Prompt = getStage1Prompt(

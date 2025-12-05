@@ -81,8 +81,10 @@ async function generateConversationScenarios(assistantId, maxCount) {
         // Create conversation scenario
         const scenario = {
           type: determineConversationType(variation),
-          userInput: conversationConfig.defaultIntroMessage,
-          customerProfile: variation.processedMessage,
+          userInput: variation.processedMessage, // policy question with selected option
+          customerProfile:
+            variation.replacements?.[0]?.replacementValue ||
+            variation.processedMessage, // reuse selection as assistant stub
           title: generateScenarioTitle(variation),
           metadata: {
             originalMessage: introMessage.value,
@@ -123,11 +125,8 @@ async function generateConversationScenarios(assistantId, maxCount) {
  * Determine conversation type based on the generated content
  */
 function determineConversationType(variation) {
-  const content = variation.processedMessage.toLowerCase();
-
-  // Simple logic - could be enhanced based on actual content
-  const types = ["mevcut_musteri", "yeni_musteri"];
-  return types[Math.floor(Math.random() * types.length)];
+  // Single type for policy Q&A assistant
+  return "policy_query";
 }
 
 /**
@@ -138,15 +137,10 @@ function generateScenarioTitle(variation) {
 
   if (replacements.length > 0) {
     const firstReplacement = replacements[0].replacementValue;
-    const type = determineConversationType(variation);
-    const icon = type === "mevcut_musteri" ? "2️⃣" : "1️⃣";
-    const typeText =
-      type === "mevcut_musteri" ? "Mevcut müşteri" : "Yeni müşteri";
-
-    return `${icon} ${typeText} - ${firstReplacement}`;
+    return `Politika: ${firstReplacement}`;
   }
 
-  return "🔄 Dinamik Senaryo";
+  return "Politika Senaryosu";
 }
 
 /**
@@ -167,7 +161,7 @@ async function createConversation(scenario, assistantId) {
         isGptSuitable: true,
       },
       {
-        content: scenario.customerProfile,
+        content: `İstediğiniz politika: ${scenario.customerProfile}`,
         type: "text",
         role: "assistant",
         createdAt: new Date(Date.now() + 1000).toISOString(), // 1 second later
@@ -183,7 +177,7 @@ async function createConversation(scenario, assistantId) {
     localDateTime: timestamp,
     type: "chat",
     title: scenario.title,
-    lastMessage: scenario.customerProfile,
+    lastMessage: `İstediğiniz politika: ${scenario.customerProfile}`,
   };
 
   // Prepare Lambda event payload (mimicking API Gateway structure)
@@ -336,13 +330,6 @@ function displaySummary(results) {
   console.log(`${"=".repeat(60)}`);
 
   const successfulCreations = results.filter((r) => r !== null);
-  const mevcut = successfulCreations.filter(
-    (r) => r.scenario.type === "mevcut_musteri"
-  );
-  const yeni = successfulCreations.filter(
-    (r) => r.scenario.type === "yeni_musteri"
-  );
-
   console.log(`\n📊 Results:`);
   console.log(`• Total attempts: ${CONVERSATIONS_TO_CREATE.length}`);
   console.log(`• Successful: ${successfulCreations.length}`);
@@ -350,17 +337,14 @@ function displaySummary(results) {
     `• Failed: ${CONVERSATIONS_TO_CREATE.length - successfulCreations.length}`
   );
 
-  console.log(`\n👥 Customer Type Distribution:`);
-  console.log(`• 2️⃣ Mevcut müşteri: ${mevcut.length}`);
-  console.log(`• 1️⃣ Yeni müşteri: ${yeni.length}`);
-
-  console.log(`\n📋 Created Conversation IDs:`);
-  successfulCreations.forEach((result, index) => {
-    const icon = result.scenario.type === "mevcut_musteri" ? "2️⃣" : "1️⃣";
-    console.log(`${icon} ${result.conversationId} - ${result.scenario.type}`);
-  });
-
   if (successfulCreations.length > 0) {
+    console.log(`\n📋 Created Conversation IDs:`);
+    successfulCreations.forEach((result, index) => {
+      console.log(
+        `${index + 1}. ${result.conversationId} - ${result.scenario.type}`
+      );
+    });
+
     console.log(`\n💡 Next Steps:`);
     console.log(`1. Use these conversation IDs in your RAG validation tests`);
     console.log(
@@ -398,7 +382,7 @@ async function previewScenarios(assistantId) {
       console.log(`📝 Title: ${scenario.title}`);
       console.log(`👤 User Input: ${scenario.userInput.substring(0, 100)}...`);
       console.log(
-        `🤖 Customer Profile: ${scenario.customerProfile.substring(0, 100)}...`
+        `🤖 Assistant Stub: ${scenario.customerProfile.substring(0, 100)}...`
       );
 
       if (scenario.metadata?.replacements) {
