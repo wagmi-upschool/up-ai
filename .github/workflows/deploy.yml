@@ -1,0 +1,110 @@
+name: Build and Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: 399843200753.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: upwagmitech-node-app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set env by branch
+        id: set-env
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "staging" ]; then
+            echo "ENV_NAME=staging" >> $GITHUB_ENV
+            echo "TASK_FAMILY=llamaindex_task_staging" >> $GITHUB_ENV
+            echo "CONTAINER_NAME=llamaindex_container_staging" >> $GITHUB_ENV
+            echo "SERVICE_NAME=llamaindex_task_staging-service-ag3cyxrn" >> $GITHUB_ENV
+            echo "TAG_ENV=staging" >> $GITHUB_ENV
+          elif [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "ENV_NAME=prod" >> $GITHUB_ENV
+            echo "TASK_FAMILY=llamaindex_task" >> $GITHUB_ENV
+            echo "CONTAINER_NAME=llamaindex_container" >> $GITHUB_ENV
+            echo "SERVICE_NAME=cluster" >> $GITHUB_ENV
+            echo "TAG_ENV=prod" >> $GITHUB_ENV
+          else
+            echo "Unsupported branch ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: true
+
+      - name: Build and push image
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          TAG1="${IMAGE_URI}:${TAG_ENV}-${SHORT_SHA}"
+          TAG2="${IMAGE_URI}:${TAG_ENV}-latest"
+          docker buildx build \
+            --platform linux/arm64 \
+            -t "${TAG1}" \
+            -t "${TAG2}" \
+            . \
+            --push
+          echo "IMAGE_TAG=${TAG2}" >> $GITHUB_ENV
+
+      - name: Prepare new task definition
+        id: task-def
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${TASK_FAMILY}" \
+            --query "taskDefinition" > task-def.json
+
+          cat task-def.json | \
+            jq --arg IMG "${IMAGE_TAG}" --arg NAME "${CONTAINER_NAME}" '
+              .containerDefinitions = (.containerDefinitions
+                | map(if .name == $NAME then .image = $IMG | . else . end))
+            ' > new-task-def.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "NEW_TASK_DEF_ARN=${NEW_TASK_DEF_ARN}" >> $GITHUB_ENV
+          echo "New task def: ${NEW_TASK_DEF_ARN}"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster DevCluster \
+            --service "${SERVICE_NAME}" \
+            --task-definition "${NEW_TASK_DEF_ARN}" \
+            --force-new-deployment
+
+      - name: Summary
+        run: |
+          echo "Branch          : ${GITHUB_REF_NAME}"
+          echo "Environment     : ${ENV_NAME}"
+          echo "Service         : ${SERVICE_NAME}"
+          echo "Task family     : ${TASK_FAMILY}"
+          echo "Container       : ${CONTAINER_NAME}"
+          echo "Image deployed  : ${IMAGE_TAG}"
+          echo "Task def ARN    : ${NEW_TASK_DEF_ARN}"
