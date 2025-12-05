@@ -78,6 +78,7 @@ jobs:
             --query "taskDefinition" > task-def.json
 
           cat task-def.json | \
+            jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' | \
             jq --arg IMG "${IMAGE_TAG}" --arg NAME "${CONTAINER_NAME}" '
               .containerDefinitions = (.containerDefinitions
                 | map(if .name == $NAME then .image = $IMG | . else . end))
