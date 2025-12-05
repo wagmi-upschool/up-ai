@@ -73,17 +73,19 @@ jobs:
       - name: Prepare new task definition
         id: task-def
         run: |
+          # 1. Fetch the current task definition
           aws ecs describe-task-definition \
             --task-definition "${TASK_FAMILY}" \
             --query "taskDefinition" > task-def.json
 
-          cat task-def.json | \
-            jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' | \
-            jq --arg IMG "${IMAGE_TAG}" --arg NAME "${CONTAINER_NAME}" '
-              .containerDefinitions = (.containerDefinitions
-                | map(if .name == $NAME then .image = $IMG | . else . end))
-            ' > new-task-def.json
+          # 2. Filter out read-only fields AND update the image in one pass
+          # We remove fields that AWS ECS RegisterTaskDefinition does not accept.
+          jq --arg IMG "${IMAGE_TAG}" --arg NAME "${CONTAINER_NAME}" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
+            .containerDefinitions |= map(if .name == $NAME then .image = $IMG else . end)
+          ' task-def.json > new-task-def.json
 
+          # 3. Register the new task definition
           NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://new-task-def.json \
             --query "taskDefinition.taskDefinitionArn" \
