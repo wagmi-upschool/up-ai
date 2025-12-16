@@ -53,6 +53,18 @@ function getAzureEmbeddingOptions() {
   };
 }
 
+// Normalize noisy topic labels (e.g., "2️⃣ İlk Kademe Yönetim (...)") into the plain value stored in metadata
+function normalizeTopicValue(topic) {
+  if (!topic) return null;
+  // Drop anything in parentheses and strip emojis/numbers/punctuation
+  const withoutParens = topic.split("(")[0];
+  const cleaned = withoutParens
+    .replace(/[^\p{L}\s]/gu, " ") // keep only letters and spaces
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
 function logRetrieverSamples(results, label = "results", maxItems = 3) {
   try {
     results.slice(0, maxItems).forEach((doc, idx) => {
@@ -131,6 +143,7 @@ function createAssistantRetriever({
   assistantId,
   topic,
 }) {
+  const normalizedTopic = normalizeTopicValue(topic);
   const filters = [
     {
       key: "assistantId",
@@ -139,13 +152,19 @@ function createAssistantRetriever({
     },
   ];
 
-  if (topic) {
+  if (normalizedTopic) {
     filters.push({
       key: "topic",
-      value: topic,
+      value: normalizedTopic,
       operator: "==",
     });
-    console.log(`Filtering assistant documents by topic: ${topic}`);
+    console.log(
+      `Filtering assistant documents by topic: ${normalizedTopic} (raw: ${topic})`
+    );
+  } else if (topic) {
+    console.log(
+      `Skipping topic filter; could not normalize topic from raw: ${topic}`
+    );
   }
 
   return new VectorIndexRetriever({
