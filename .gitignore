@@ -6,3 +6,4 @@ package-lock.json
 exports/
 logs
 files
+app.log

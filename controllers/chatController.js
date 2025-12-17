@@ -23,6 +23,9 @@ const assistantInputOptionsService = new AssistantInputOptionsService({
   stage: process.env.STAGE,
 });
 
+// In-process cache to persist detected topics per conversation across turns
+const conversationTopicCache = new Map();
+
 // Helper function for timing measurements
 function getTimeElapsed(startTime) {
   const elapsed = process.hrtime(startTime);
@@ -65,6 +68,59 @@ function normalizeTopicValue(topic) {
   return cleaned.length > 0 ? cleaned : null;
 }
 
+function normalizeInputOptions(options = []) {
+  return options
+    .map((opt) => {
+      const raw = (opt.value || opt.text || opt.SK || "").toString().trim();
+      return raw
+        ? {
+            raw,
+            normalized: raw.toLocaleLowerCase("tr"),
+          }
+        : null;
+    })
+    .filter(Boolean);
+}
+
+function matchTopicFromText(text, normalizedOptions = []) {
+  if (!text || !normalizedOptions.length) return null;
+  const normalizedText = text.toString().toLocaleLowerCase("tr").trim();
+  if (!normalizedText) return null;
+  const matched = normalizedOptions.find((opt) =>
+    normalizedText.includes(opt.normalized)
+  );
+  return matched ? matched.raw : null;
+}
+
+function detectTopicFromHistory(historyNodes = [], normalizedOptions = []) {
+  if (!historyNodes.length || !normalizedOptions.length) return null;
+
+  // Prefer the latest user messages, then fall back to any message content
+  const sorted = [...historyNodes].sort((a, b) => {
+    const tsA = new Date(
+      a?.node?.metadata?.timestamp || a?.node?.metadata?.createdAt || 0
+    ).getTime();
+    const tsB = new Date(
+      b?.node?.metadata?.timestamp || b?.node?.metadata?.createdAt || 0
+    ).getTime();
+    return tsB - tsA;
+  });
+
+  const tryMatch = (nodes) => {
+    for (const node of nodes) {
+      const match = matchTopicFromText(node?.node?.text, normalizedOptions);
+      if (match) return match;
+    }
+    return null;
+  };
+
+  const userNodes = sorted.filter(
+    (n) => (n?.node?.metadata?.role || "").toLowerCase() === "user"
+  );
+
+  return tryMatch(userNodes) || tryMatch(sorted);
+}
+
 function logRetrieverSamples(results, label = "results", maxItems = 3) {
   try {
     results.slice(0, maxItems).forEach((doc, idx) => {
@@ -76,12 +132,11 @@ function logRetrieverSamples(results, label = "results", maxItems = 3) {
       console.log(
         `[${label} ${idx}] score=${(doc?.score || 0).toFixed(
           3
-        )} metadata=${JSON.stringify(doc?.node?.metadata || {})} text="${trimmedText}"`
+        )} metadata=${JSON.stringify(
+          doc?.node?.metadata || {}
+        )} text="${trimmedText}"`
       );
-      console.log(
-        `[${label} ${idx} metadata obj]:`,
-        doc?.node?.metadata || {}
-      );
+      console.log(`[${label} ${idx} metadata obj]:`, doc?.node?.metadata || {});
     });
   } catch (err) {
     console.error("Error logging retriever samples:", err);
@@ -207,6 +262,30 @@ class CombinedRetriever {
   }
 }
 
+class AssistantRetrieverWithFallback {
+  constructor(primaryRetriever, fallbackRetriever, topicLabel) {
+    this.primaryRetriever = primaryRetriever;
+    this.fallbackRetriever = fallbackRetriever;
+    this.topicLabel = topicLabel;
+  }
+
+  async retrieve(query) {
+    const primaryResults = await this.primaryRetriever.retrieve(query);
+    if (primaryResults && primaryResults.length > 0) {
+      return primaryResults;
+    }
+
+    if (this.fallbackRetriever) {
+      console.log(
+        `Assistant retriever returned 0 results with topic filter "${this.topicLabel}". Falling back to assistantId-only retrieval.`
+      );
+      return this.fallbackRetriever.retrieve(query);
+    }
+
+    return primaryResults || [];
+  }
+}
+
 async function fetchAssistantConfig(assistantId, stage) {
   const env = stage ?? process.env.STAGE;
   const params = {
@@ -274,21 +353,27 @@ export async function handleLLMStream(req, res) {
     const { index_chat_messages, index_assistant_documents } =
       await createIndices();
 
-    // Detect topic from first user message (only when no prior user messages)
+    // Detect topic from current query or recover from prior conversation turns
     const normalizedConversationId =
       conversationId &&
       conversationId !== "null" &&
       conversationId !== "undefined"
         ? conversationId
         : null;
+    const cachedTopic =
+      normalizedConversationId &&
+      conversationTopicCache.has(normalizedConversationId)
+        ? conversationTopicCache.get(normalizedConversationId)
+        : null;
     let priorUserMessages = 0;
+    let historyNodes = [];
     if (normalizedConversationId) {
       try {
         const chatHistoryRetriever = createChatRetriever({
           index_chat_messages,
           conversationId: normalizedConversationId,
         });
-        const historyNodes = await chatHistoryRetriever.retrieve(
+        historyNodes = await chatHistoryRetriever.retrieve(
           "conversation history context"
         );
         priorUserMessages = historyNodes.filter(
@@ -304,42 +389,58 @@ export async function handleLLMStream(req, res) {
     }
     const isFirstUserMessage = priorUserMessages === 0;
     let detectedTopic = null;
+    let normalizedOptions = [];
 
-    if (isFirstUserMessage && query) {
+    if (assistantId && query) {
       try {
-        const normalizedQuery = query.toString().toLocaleLowerCase("tr").trim();
         const service =
           stage && stage !== process.env.STAGE
             ? new AssistantInputOptionsService({ stage })
             : assistantInputOptionsService;
         const options = await service.getAllOptions(assistantId);
-        const normalizedOptions = options
-          .map((opt) => {
-            const raw =
-              (opt.value || opt.text || opt.SK || "").toString().trim();
-            return {
-              raw,
-              normalized: raw.toLocaleLowerCase("tr"),
-            };
-          })
-          .filter((opt) => opt.normalized.length > 0);
+        normalizedOptions = normalizeInputOptions(options);
 
-        const matched = normalizedOptions.find((opt) =>
-          normalizedQuery.includes(opt.normalized)
-        );
-        if (matched) {
-          detectedTopic = matched.raw;
+        detectedTopic = matchTopicFromText(query, normalizedOptions);
+        if (detectedTopic) {
           console.log(
-            `First user message matched input option for topic filter: ${detectedTopic}`
+            `Topic detected from current query for topic filter: ${detectedTopic}`
           );
-        } else {
+        }
+
+        if (!detectedTopic && historyNodes.length) {
+          const recoveredTopic = detectTopicFromHistory(
+            historyNodes,
+            normalizedOptions
+          );
+          if (recoveredTopic) {
+            detectedTopic = recoveredTopic;
+            console.log(
+              `Topic recovered from conversation history for topic filter: ${detectedTopic}`
+            );
+          }
+        }
+
+        if (!detectedTopic && normalizedOptions.length) {
           console.log(
-            "First user message did not match any input option; no topic filter applied."
+            isFirstUserMessage
+              ? "First user message did not match any input option; no topic filter applied."
+              : "No topic match in current query or history; skipping topic filter."
           );
         }
       } catch (err) {
         console.error("Error detecting topic from input options:", err);
       }
+    }
+
+    if (!detectedTopic && cachedTopic) {
+      detectedTopic = cachedTopic;
+      console.log(
+        `Using cached topic for conversation ${normalizedConversationId}: ${cachedTopic}`
+      );
+    }
+
+    if (detectedTopic && normalizedConversationId) {
+      conversationTopicCache.set(normalizedConversationId, detectedTopic);
     }
 
     let retrievers = [];
@@ -356,12 +457,28 @@ export async function handleLLMStream(req, res) {
 
     // Add assistant retriever if we have an assistant ID
     if (assistantId) {
-      const retriever_assistant = createAssistantRetriever({
+      const primaryAssistantRetriever = createAssistantRetriever({
         index_assistant_documents,
         assistantId,
         topic: detectedTopic,
       });
-      retrievers.push(retriever_assistant);
+
+      // Fallback: if topic-filtered retrieval returns zero, retry without topic
+      const fallbackAssistantRetriever = detectedTopic
+        ? createAssistantRetriever({
+            index_assistant_documents,
+            assistantId,
+            topic: null,
+          })
+        : null;
+
+      const assistantRetrieverWrapper = new AssistantRetrieverWithFallback(
+        primaryAssistantRetriever,
+        fallbackAssistantRetriever,
+        detectedTopic
+      );
+
+      retrievers.push(assistantRetrieverWrapper);
     }
 
     // Create combined retriever
@@ -369,7 +486,7 @@ export async function handleLLMStream(req, res) {
 
     // Get results from all retrievers
     const results = await combinedRetriever.retrieve(query);
-    console.log("Retrieved results (raw):", results);
+    //console.log("Retrieved results (raw):", results);
     try {
       const formatted = results.slice(0, 5).map((doc) => ({
         score: doc?.score || 0,
@@ -383,13 +500,42 @@ export async function handleLLMStream(req, res) {
         "Retrieved results (formatted metadata):",
         JSON.stringify(formatted, null, 2)
       );
+
+      const assistantDocCount = results.filter(
+        (doc) =>
+          (doc?.node?.metadata?.source || "").toLowerCase() ===
+          "assistant-documents"
+      ).length;
+      const chatMessageCount = results.length - assistantDocCount;
+      console.log(
+        `Retrieval counts -> assistant-documents: ${assistantDocCount}, chat-messages: ${chatMessageCount}`
+      );
     } catch (err) {
       console.error("Error formatting retrieved results:", err);
     }
     logRetrieverSamples(results, "retrieverResults", 5);
 
-    if (!conversationId || conversationId === "null" || results.length === 0) {
-      console.log("Using direct LLM response");
+    const assistantDocResults = results.filter(
+      (doc) =>
+        (doc?.node?.metadata?.source || "").toLowerCase() ===
+        "assistant-documents"
+    );
+    if (assistantDocResults.length) {
+      console.log(
+        `Logging all assistant-documents results (${assistantDocResults.length})`
+      );
+      logRetrieverSamples(
+        assistantDocResults,
+        "assistantDocsOnly",
+        assistantDocResults.length
+      );
+    } else {
+      console.log("No assistant-documents results to log.");
+    }
+
+    const hasRetrieverResults = results.length > 0;
+    if (!hasRetrieverResults) {
+      console.log("Using direct LLM response (no retriever results)");
       const llm = new OpenAI({
         azure: {
           endpoint: process.env.AZURE_OPENAI_ENDPOINT,
