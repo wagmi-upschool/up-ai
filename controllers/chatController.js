@@ -513,7 +513,7 @@ export async function handleLLMStream(req, res) {
     } catch (err) {
       console.error("Error formatting retrieved results:", err);
     }
-    logRetrieverSamples(results, "retrieverResults", 5);
+    //logRetrieverSamples(results, "retrieverResults", 5);
 
     const assistantDocResults = results.filter(
       (doc) =>
@@ -524,11 +524,7 @@ export async function handleLLMStream(req, res) {
       console.log(
         `Logging all assistant-documents results (${assistantDocResults.length})`
       );
-      logRetrieverSamples(
-        assistantDocResults,
-        "assistantDocsOnly",
-        assistantDocResults.length
-      );
+      logRetrieverSamples(assistantDocResults, "assistantDocsOnly", 5);
     } else {
       console.log("No assistant-documents results to log.");
     }
