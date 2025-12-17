@@ -4,8 +4,6 @@ import {
   VectorStoreIndex,
   Settings,
   OpenAIEmbedding,
-  getResponseSynthesizer,
-  RetrieverQueryEngine,
   VectorIndexRetriever,
 } from "llamaindex";
 import { GetCommand } from "@aws-sdk/lib-dynamodb";
@@ -25,6 +23,19 @@ const assistantInputOptionsService = new AssistantInputOptionsService({
 
 // In-process cache to persist detected topics per conversation across turns
 const conversationTopicCache = new Map();
+
+const RETRIEVER_LIMITS = {
+  assistant: {
+    topK: 24,
+    minScore: 0.3,
+    maxItems: 16,
+  },
+  chat: {
+    topK: 20,
+    minScore: 0.15,
+    maxItems: 10,
+  },
+};
 
 // Helper function for timing measurements
 function getTimeElapsed(startTime) {
@@ -54,6 +65,108 @@ function getAzureEmbeddingOptions() {
     deployment: "text-embedding-3-small",
     apiKey: process.env.AZURE_OPENAI_KEY,
   };
+}
+
+function filterAndTrimResults(nodes = [], minScore = 0, maxItems = null) {
+  const filtered = nodes
+    .filter((doc) => (doc?.score || 0) >= minScore)
+    .sort((a, b) => (b?.score || 0) - (a?.score || 0));
+  return maxItems ? filtered.slice(0, maxItems) : filtered;
+}
+
+function filterRetrieverResults(results = []) {
+  const assistantDocs = [];
+  const chatMessages = [];
+  const unknown = [];
+
+  results.forEach((doc) => {
+    const source = (doc?.node?.metadata?.source || "").toLowerCase();
+    if (source === "assistant-documents") {
+      assistantDocs.push(doc);
+    } else if (source === "chat-messages") {
+      chatMessages.push(doc);
+    } else {
+      unknown.push(doc);
+    }
+  });
+
+  const filteredAssistant = filterAndTrimResults(
+    assistantDocs,
+    RETRIEVER_LIMITS.assistant.minScore,
+    RETRIEVER_LIMITS.assistant.maxItems
+  );
+  const filteredChat = filterAndTrimResults(
+    chatMessages,
+    RETRIEVER_LIMITS.chat.minScore,
+    RETRIEVER_LIMITS.chat.maxItems
+  );
+
+  const fallbackUnknown =
+    filteredAssistant.length === 0 &&
+    filteredChat.length === 0 &&
+    unknown.length > 0
+      ? filterAndTrimResults(
+          unknown,
+          RETRIEVER_LIMITS.assistant.minScore,
+          Math.min(unknown.length, 5)
+        )
+      : [];
+
+  return {
+    filtered: [...filteredChat, ...filteredAssistant, ...fallbackUnknown],
+    stats: {
+      assistant: { total: assistantDocs.length, kept: filteredAssistant.length },
+      chat: { total: chatMessages.length, kept: filteredChat.length },
+      unknown: { total: unknown.length, kept: fallbackUnknown.length },
+    },
+  };
+}
+
+async function streamDirectLLM({
+  res,
+  systemPrompt,
+  query,
+  assistantConfig,
+}) {
+  const llm = new OpenAI({
+    azure: {
+      endpoint: process.env.AZURE_OPENAI_ENDPOINT,
+      deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+      apiKey: process.env.AZURE_OPENAI_KEY,
+    },
+    model: process.env.MODEL,
+    additionalChatOptions: {
+      frequency_penalty: assistantConfig.frequencyPenalty,
+      presence_penalty: assistantConfig.presencePenalty,
+      stream: true,
+    },
+    temperature: assistantConfig.temperature,
+    topP: assistantConfig.topP,
+  });
+
+  const response = await llm.chat({
+    messages: [
+      {
+        role: "system",
+        content: systemPrompt,
+      },
+      {
+        role: "user",
+        content: query,
+      },
+    ],
+    stream: true,
+  });
+
+  let fullOutput = "";
+  let hasWritten = false;
+  for await (const chunk of response) {
+    fullOutput += chunk.delta;
+    res.write(chunk.delta);
+    hasWritten = true;
+  }
+
+  return { fullOutput, hasWritten };
 }
 
 // Normalize noisy topic labels (e.g., "2️⃣ İlk Kademe Yönetim (...)") into the plain value stored in metadata
@@ -228,7 +341,7 @@ function createAssistantRetriever({
     filters: {
       filters,
     },
-    similarityTopK: 100,
+    similarityTopK: RETRIEVER_LIMITS.assistant.topK,
   });
 }
 
@@ -245,7 +358,7 @@ function createChatRetriever({ index_chat_messages, conversationId }) {
         },
       ],
     },
-    similarityTopK: 100,
+    similarityTopK: RETRIEVER_LIMITS.chat.topK,
   });
 }
 
@@ -444,7 +557,6 @@ export async function handleLLMStream(req, res) {
     }
 
     let retrievers = [];
-    let response;
 
     // Add chat retriever if we have a conversation ID
     if (normalizedConversationId) {
@@ -486,9 +598,11 @@ export async function handleLLMStream(req, res) {
 
     // Get results from all retrievers
     const results = await combinedRetriever.retrieve(query);
-    //console.log("Retrieved results (raw):", results);
+    const { filtered: filteredResults, stats: filteredStats } =
+      filterRetrieverResults(results);
+
     try {
-      const formatted = results.slice(0, 5).map((doc) => ({
+      const formatted = filteredResults.slice(0, 5).map((doc) => ({
         score: doc?.score || 0,
         metadata: doc?.node?.metadata || {},
         text:
@@ -508,14 +622,17 @@ export async function handleLLMStream(req, res) {
       ).length;
       const chatMessageCount = results.length - assistantDocCount;
       console.log(
-        `Retrieval counts -> assistant-documents: ${assistantDocCount}, chat-messages: ${chatMessageCount}`
+        `Retrieval counts (raw) -> assistant-documents: ${assistantDocCount}, chat-messages: ${chatMessageCount}`
+      );
+      console.log(
+        `Retrieval counts (filtered) -> assistant-documents: ${filteredStats.assistant.kept}/${filteredStats.assistant.total}, chat-messages: ${filteredStats.chat.kept}/${filteredStats.chat.total}, unknown: ${filteredStats.unknown.kept}/${filteredStats.unknown.total}`
       );
     } catch (err) {
       console.error("Error formatting retrieved results:", err);
     }
     //logRetrieverSamples(results, "retrieverResults", 5);
 
-    const assistantDocResults = results.filter(
+    const assistantDocResults = filteredResults.filter(
       (doc) =>
         (doc?.node?.metadata?.source || "").toLowerCase() ===
         "assistant-documents"
@@ -529,84 +646,97 @@ export async function handleLLMStream(req, res) {
       console.log("No assistant-documents results to log.");
     }
 
-    const hasRetrieverResults = results.length > 0;
+    const hasRetrieverResults = filteredResults.length > 0;
+    let fullOutput = "";
+    let hasWritten = false;
+
     if (!hasRetrieverResults) {
       console.log("Using direct LLM response (no retriever results)");
-      const llm = new OpenAI({
-        azure: {
-          endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-          deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-          apiKey: process.env.AZURE_OPENAI_KEY,
-        },
-        model: process.env.MODEL,
-        additionalChatOptions: {
-          frequency_penalty: assistantConfig.frequencyPenalty,
-          presence_penalty: assistantConfig.presencePenalty,
-          stream: false,
-        },
-        temperature: assistantConfig.temperature,
-        topP: assistantConfig.topP,
+      const directResult = await streamDirectLLM({
+        res,
+        systemPrompt: replacedPatterns,
+        query,
+        assistantConfig,
       });
-
-      const response = await llm.chat({
-        messages: [
-          {
-            role: "system",
-            content: replacedPatterns,
-          },
-          {
-            role: "user",
-            content: query,
-          },
-        ],
-        stream: true,
-      });
-
-      for await (const chunk of response) {
-        res.write(chunk.delta);
-      }
-
-      console.log(response);
+      fullOutput = directResult.fullOutput;
+      hasWritten = directResult.hasWritten;
     } else {
-      console.log("Using retriever response");
+      console.log("Using retriever response with context");
 
-      const responseSynthesizer = await getResponseSynthesizer(
-        "tree_summarize",
-        {
-          llm: new OpenAI({
-            azure: {
-              endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-              deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-              apiKey: process.env.AZURE_OPENAI_KEY,
-            },
-            model: process.env.MODEL,
-            additionalChatOptions: {
-              frequency_penalty: assistantConfig.frequencyPenalty,
-              presence_penalty: assistantConfig.presencePenalty,
-              stream: true,
-            },
-            temperature: assistantConfig.temperature,
-            topP: assistantConfig.topP,
-          }),
-        }
-      );
-
-      const queryEngine = new RetrieverQueryEngine(
-        combinedRetriever,
-        responseSynthesizer
-      );
-
-      response = await queryEngine.query({
-        query: query,
-        stream: true,
+      // Build context from retrieved documents
+      const contextParts = filteredResults.map((doc, idx) => {
+        const text = doc?.node?.text || "";
+        return `[Document ${idx + 1}]:\n${text}`;
       });
+      const retrievedContext = contextParts.join("\n\n");
 
-      console.log(response);
-      let fullOutput = "";
-      for await (const chunk of response) {
-        fullOutput += chunk.delta;
-        res.write(chunk.delta);
+      // Build system prompt with retrieved context
+      const systemPromptWithContext = `${replacedPatterns}
+
+---
+İlgili Bilgiler:
+${retrievedContext}
+---
+
+Yukarıdaki bilgileri kullanarak kullanıcının sorusuna kapsamlı ve eğitici bir şekilde cevap ver.`;
+
+      try {
+        const llm = new OpenAI({
+          azure: {
+            endpoint: process.env.AZURE_OPENAI_ENDPOINT,
+            deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+            apiKey: process.env.AZURE_OPENAI_KEY,
+          },
+          model: process.env.MODEL,
+          additionalChatOptions: {
+            frequency_penalty: assistantConfig.frequencyPenalty,
+            presence_penalty: assistantConfig.presencePenalty,
+            stream: true,
+          },
+          temperature: assistantConfig.temperature,
+          topP: assistantConfig.topP,
+        });
+
+        const responseStream = await llm.chat({
+          messages: [
+            {
+              role: "system",
+              content: systemPromptWithContext,
+            },
+            {
+              role: "user",
+              content: query,
+            },
+          ],
+          stream: true,
+        });
+
+        for await (const chunk of responseStream) {
+          fullOutput += chunk.delta;
+          res.write(chunk.delta);
+          hasWritten = true;
+        }
+      } catch (synthError) {
+        console.error(
+          "Error streaming retriever response, falling back to direct LLM:",
+          synthError
+        );
+        if (!hasWritten) {
+          const directResult = await streamDirectLLM({
+            res,
+            systemPrompt: replacedPatterns,
+            query,
+            assistantConfig,
+          });
+          fullOutput = directResult.fullOutput;
+          hasWritten = directResult.hasWritten;
+        } else {
+          res.write("\n[ERROR] Streaming interrupted");
+        }
       }
+    }
+
+    if (fullOutput) {
       console.log("Full output:", fullOutput);
     }
     res.write("[DONE-UP]");
