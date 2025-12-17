@@ -32,7 +32,7 @@ const RETRIEVER_LIMITS = {
   },
   chat: {
     topK: 20,
-    minScore: 0.15,
+    minScore: 0.0, // Chat history should always be included regardless of similarity
     maxItems: 10,
   },
 };
@@ -74,60 +74,8 @@ function filterAndTrimResults(nodes = [], minScore = 0, maxItems = null) {
   return maxItems ? filtered.slice(0, maxItems) : filtered;
 }
 
-function filterRetrieverResults(results = []) {
-  const assistantDocs = [];
-  const chatMessages = [];
-  const unknown = [];
 
-  results.forEach((doc) => {
-    const source = (doc?.node?.metadata?.source || "").toLowerCase();
-    if (source === "assistant-documents") {
-      assistantDocs.push(doc);
-    } else if (source === "chat-messages") {
-      chatMessages.push(doc);
-    } else {
-      unknown.push(doc);
-    }
-  });
-
-  const filteredAssistant = filterAndTrimResults(
-    assistantDocs,
-    RETRIEVER_LIMITS.assistant.minScore,
-    RETRIEVER_LIMITS.assistant.maxItems
-  );
-  const filteredChat = filterAndTrimResults(
-    chatMessages,
-    RETRIEVER_LIMITS.chat.minScore,
-    RETRIEVER_LIMITS.chat.maxItems
-  );
-
-  const fallbackUnknown =
-    filteredAssistant.length === 0 &&
-    filteredChat.length === 0 &&
-    unknown.length > 0
-      ? filterAndTrimResults(
-          unknown,
-          RETRIEVER_LIMITS.assistant.minScore,
-          Math.min(unknown.length, 5)
-        )
-      : [];
-
-  return {
-    filtered: [...filteredChat, ...filteredAssistant, ...fallbackUnknown],
-    stats: {
-      assistant: { total: assistantDocs.length, kept: filteredAssistant.length },
-      chat: { total: chatMessages.length, kept: filteredChat.length },
-      unknown: { total: unknown.length, kept: fallbackUnknown.length },
-    },
-  };
-}
-
-async function streamDirectLLM({
-  res,
-  systemPrompt,
-  query,
-  assistantConfig,
-}) {
+async function streamDirectLLM({ res, systemPrompt, query, assistantConfig }) {
   const llm = new OpenAI({
     azure: {
       endpoint: process.env.AZURE_OPENAI_ENDPOINT,
@@ -362,43 +310,6 @@ function createChatRetriever({ index_chat_messages, conversationId }) {
   });
 }
 
-class CombinedRetriever {
-  constructor(retrievers) {
-    this.retrievers = retrievers;
-  }
-
-  async retrieve(query) {
-    const results = await Promise.all(
-      this.retrievers.map((retriever) => retriever.retrieve(query))
-    );
-    return results.flat();
-  }
-}
-
-class AssistantRetrieverWithFallback {
-  constructor(primaryRetriever, fallbackRetriever, topicLabel) {
-    this.primaryRetriever = primaryRetriever;
-    this.fallbackRetriever = fallbackRetriever;
-    this.topicLabel = topicLabel;
-  }
-
-  async retrieve(query) {
-    const primaryResults = await this.primaryRetriever.retrieve(query);
-    if (primaryResults && primaryResults.length > 0) {
-      return primaryResults;
-    }
-
-    if (this.fallbackRetriever) {
-      console.log(
-        `Assistant retriever returned 0 results with topic filter "${this.topicLabel}". Falling back to assistantId-only retrieval.`
-      );
-      return this.fallbackRetriever.retrieve(query);
-    }
-
-    return primaryResults || [];
-  }
-}
-
 async function fetchAssistantConfig(assistantId, stage) {
   const env = stage ?? process.env.STAGE;
   const params = {
@@ -556,18 +467,21 @@ export async function handleLLMStream(req, res) {
       conversationTopicCache.set(normalizedConversationId, detectedTopic);
     }
 
-    let retrievers = [];
+    // Retrieve chat messages and assistant docs separately
+    let chatResults = [];
+    let assistantResults = [];
 
-    // Add chat retriever if we have a conversation ID
+    // Get chat history if we have a conversation ID
     if (normalizedConversationId) {
       const retriever_chat = createChatRetriever({
         index_chat_messages,
         conversationId: normalizedConversationId,
       });
-      retrievers.push(retriever_chat);
+      chatResults = await retriever_chat.retrieve(query);
+      console.log(`Chat retriever returned ${chatResults.length} messages`);
     }
 
-    // Add assistant retriever if we have an assistant ID
+    // Get assistant documents if we have an assistant ID
     if (assistantId) {
       const primaryAssistantRetriever = createAssistantRetriever({
         index_assistant_documents,
@@ -575,31 +489,39 @@ export async function handleLLMStream(req, res) {
         topic: detectedTopic,
       });
 
+      assistantResults = await primaryAssistantRetriever.retrieve(query);
+
       // Fallback: if topic-filtered retrieval returns zero, retry without topic
-      const fallbackAssistantRetriever = detectedTopic
-        ? createAssistantRetriever({
-            index_assistant_documents,
-            assistantId,
-            topic: null,
-          })
-        : null;
-
-      const assistantRetrieverWrapper = new AssistantRetrieverWithFallback(
-        primaryAssistantRetriever,
-        fallbackAssistantRetriever,
-        detectedTopic
-      );
-
-      retrievers.push(assistantRetrieverWrapper);
+      if (assistantResults.length === 0 && detectedTopic) {
+        console.log(`Assistant retriever returned 0 results with topic filter "${detectedTopic}". Falling back to assistantId-only retrieval.`);
+        const fallbackRetriever = createAssistantRetriever({
+          index_assistant_documents,
+          assistantId,
+          topic: null,
+        });
+        assistantResults = await fallbackRetriever.retrieve(query);
+      }
+      console.log(`Assistant retriever returned ${assistantResults.length} documents`);
     }
 
-    // Create combined retriever
-    const combinedRetriever = new CombinedRetriever(retrievers);
+    // Filter and limit results separately
+    const filteredChat = filterAndTrimResults(
+      chatResults,
+      RETRIEVER_LIMITS.chat.minScore,
+      RETRIEVER_LIMITS.chat.maxItems
+    );
+    const filteredAssistant = filterAndTrimResults(
+      assistantResults,
+      RETRIEVER_LIMITS.assistant.minScore,
+      RETRIEVER_LIMITS.assistant.maxItems
+    );
 
-    // Get results from all retrievers
-    const results = await combinedRetriever.retrieve(query);
-    const { filtered: filteredResults, stats: filteredStats } =
-      filterRetrieverResults(results);
+    // Combine filtered results: chat first, then assistant docs
+    const filteredResults = [...filteredChat, ...filteredAssistant];
+    const filteredStats = {
+      assistant: { total: assistantResults.length, kept: filteredAssistant.length },
+      chat: { total: chatResults.length, kept: filteredChat.length },
+    };
 
     try {
       const formatted = filteredResults.slice(0, 5).map((doc) => ({
@@ -615,17 +537,11 @@ export async function handleLLMStream(req, res) {
         JSON.stringify(formatted, null, 2)
       );
 
-      const assistantDocCount = results.filter(
-        (doc) =>
-          (doc?.node?.metadata?.source || "").toLowerCase() ===
-          "assistant-documents"
-      ).length;
-      const chatMessageCount = results.length - assistantDocCount;
       console.log(
-        `Retrieval counts (raw) -> assistant-documents: ${assistantDocCount}, chat-messages: ${chatMessageCount}`
+        `Retrieval counts (raw) -> assistant-documents: ${assistantResults.length}, chat-messages: ${chatResults.length}`
       );
       console.log(
-        `Retrieval counts (filtered) -> assistant-documents: ${filteredStats.assistant.kept}/${filteredStats.assistant.total}, chat-messages: ${filteredStats.chat.kept}/${filteredStats.chat.total}, unknown: ${filteredStats.unknown.kept}/${filteredStats.unknown.total}`
+        `Retrieval counts (filtered) -> assistant-documents: ${filteredStats.assistant.kept}/${filteredStats.assistant.total}, chat-messages: ${filteredStats.chat.kept}/${filteredStats.chat.total}`
       );
     } catch (err) {
       console.error("Error formatting retrieved results:", err);
