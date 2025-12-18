@@ -143,7 +143,7 @@ function normalizeInputOptions(options = []) {
     .filter(Boolean);
 }
 
-function matchTopicFromText(text, normalizedOptions = []) {
+function matchOptionFromText(text, normalizedOptions = []) {
   if (!text || !normalizedOptions.length) return null;
   const normalizedText = text.toString().toLocaleLowerCase("tr").trim();
   if (!normalizedText) return null;
@@ -153,7 +153,7 @@ function matchTopicFromText(text, normalizedOptions = []) {
   return matched ? matched.raw : null;
 }
 
-function detectTopicFromHistory(historyNodes = [], normalizedOptions = []) {
+function detectOptionFromHistory(historyNodes = [], normalizedOptions = []) {
   if (!historyNodes.length || !normalizedOptions.length) return null;
 
   // Prefer the latest user messages, then fall back to any message content
@@ -169,7 +169,7 @@ function detectTopicFromHistory(historyNodes = [], normalizedOptions = []) {
 
   const tryMatch = (nodes) => {
     for (const node of nodes) {
-      const match = matchTopicFromText(node?.node?.text, normalizedOptions);
+      const match = matchOptionFromText(node?.node?.text, normalizedOptions);
       if (match) return match;
     }
     return null;
@@ -424,7 +424,7 @@ export async function handleLLMStream(req, res) {
         const options = await service.getAllOptions(assistantId);
         normalizedOptions = normalizeInputOptions(options);
 
-        detectedTopic = matchTopicFromText(query, normalizedOptions);
+        detectedTopic = matchOptionFromText(query, normalizedOptions);
         if (detectedTopic) {
           console.log(
             `Topic detected from current query for topic filter: ${detectedTopic}`
@@ -432,7 +432,7 @@ export async function handleLLMStream(req, res) {
         }
 
         if (!detectedTopic && historyNodes.length) {
-          const recoveredTopic = detectTopicFromHistory(
+          const recoveredTopic = detectOptionFromHistory(
             historyNodes,
             normalizedOptions
           );
@@ -466,6 +466,10 @@ export async function handleLLMStream(req, res) {
     if (detectedTopic && normalizedConversationId) {
       conversationTopicCache.set(normalizedConversationId, detectedTopic);
     }
+    const baseSystemPrompt = `${replacedPatterns}
+
+Kullanıcı kademesi: ${detectedTopic || ""}
+Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.`;
 
     // Retrieve chat messages and assistant docs separately
     let chatResults = [];
@@ -570,7 +574,7 @@ export async function handleLLMStream(req, res) {
       console.log("Using direct LLM response (no retriever results)");
       const directResult = await streamDirectLLM({
         res,
-        systemPrompt: replacedPatterns,
+        systemPrompt: baseSystemPrompt,
         query,
         assistantConfig,
       });
@@ -587,7 +591,7 @@ export async function handleLLMStream(req, res) {
       const retrievedContext = contextParts.join("\n\n");
 
       // Build system prompt with retrieved context
-      const systemPromptWithContext = `${replacedPatterns}
+      const systemPromptWithContext = `${baseSystemPrompt}
 
 ---
 İlgili Bilgiler:
@@ -640,7 +644,7 @@ Yukarıdaki bilgileri kullanarak kullanıcının sorusuna kapsamlı ve eğitici 
         if (!hasWritten) {
           const directResult = await streamDirectLLM({
             res,
-            systemPrompt: replacedPatterns,
+            systemPrompt: baseSystemPrompt,
             query,
             assistantConfig,
           });
@@ -655,6 +659,7 @@ Yukarıdaki bilgileri kullanarak kullanıcının sorusuna kapsamlı ve eğitici 
     if (fullOutput) {
       console.log("Full output:", fullOutput);
     }
+    console.log("Query:", query);
     res.write("[DONE-UP]");
     res.end();
   } catch (err) {
