@@ -137,6 +137,9 @@ function normalizeInputOptions(options = []) {
         ? {
             raw,
             normalized: raw.toLocaleLowerCase("tr"),
+            matchKey: (
+              normalizeTopicValue(raw) || raw
+            ).toLocaleLowerCase("tr"),
           }
         : null;
     })
@@ -145,12 +148,34 @@ function normalizeInputOptions(options = []) {
 
 function matchOptionFromText(text, normalizedOptions = []) {
   if (!text || !normalizedOptions.length) return null;
-  const normalizedText = text.toString().toLocaleLowerCase("tr").trim();
-  if (!normalizedText) return null;
-  const matched = normalizedOptions.find((opt) =>
-    normalizedText.includes(opt.normalized)
+  const rawText = text.toString().trim();
+  const normalizedText = (
+    normalizeTopicValue(rawText) || rawText
+  )
+    .toLocaleLowerCase("tr")
+    .trim();
+
+  if (normalizedText) {
+    const matches = normalizedOptions.filter((opt) => {
+      if (!opt.matchKey) return false;
+      return (
+        normalizedText.includes(opt.matchKey) ||
+        opt.matchKey.includes(normalizedText)
+      );
+    });
+
+    if (matches.length) {
+      matches.sort((a, b) => b.matchKey.length - a.matchKey.length);
+      return matches[0].raw;
+    }
+  }
+
+  const fallbackText = rawText.toLocaleLowerCase("tr").trim();
+  if (!fallbackText) return null;
+  const fallbackMatch = normalizedOptions.find((opt) =>
+    fallbackText.includes(opt.normalized)
   );
-  return matched ? matched.raw : null;
+  return fallbackMatch ? fallbackMatch.raw : null;
 }
 
 function detectOptionFromHistory(historyNodes = [], normalizedOptions = []) {
@@ -185,6 +210,11 @@ function detectOptionFromHistory(historyNodes = [], normalizedOptions = []) {
 function logRetrieverSamples(results, label = "results", maxItems = 3) {
   try {
     results.slice(0, maxItems).forEach((doc, idx) => {
+      const metadata = {
+        topic: doc?.node?.metadata?.topic ?? null,
+        source: doc?.node?.metadata?.source ?? null,
+        assistantId: doc?.node?.metadata?.assistantId ?? null,
+      };
       const textPreview = (doc?.node?.text || "").replace(/\s+/g, " ");
       const trimmedText =
         textPreview.length > 120
@@ -193,11 +223,8 @@ function logRetrieverSamples(results, label = "results", maxItems = 3) {
       console.log(
         `[${label} ${idx}] score=${(doc?.score || 0).toFixed(
           3
-        )} metadata=${JSON.stringify(
-          doc?.node?.metadata || {}
-        )} text="${trimmedText}"`
+        )} metadata=${JSON.stringify(metadata)} text="${trimmedText}"`
       );
-      console.log(`[${label} ${idx} metadata obj]:`, doc?.node?.metadata || {});
     });
   } catch (err) {
     console.error("Error logging retriever samples:", err);
@@ -259,7 +286,7 @@ function createAssistantRetriever({
   assistantId,
   topic,
 }) {
-  const normalizedTopic = normalizeTopicValue(topic);
+  const rawTopic = typeof topic === "string" ? topic.trim() : null;
   const filters = [
     {
       key: "assistantId",
@@ -268,18 +295,18 @@ function createAssistantRetriever({
     },
   ];
 
-  if (normalizedTopic) {
+  if (rawTopic) {
     filters.push({
       key: "topic",
-      value: normalizedTopic,
+      value: rawTopic,
       operator: "==",
     });
     console.log(
-      `Filtering assistant documents by topic: ${normalizedTopic} (raw: ${topic})`
+      `Filtering assistant documents by topic: ${rawTopic}`
     );
   } else if (topic) {
     console.log(
-      `Skipping topic filter; could not normalize topic from raw: ${topic}`
+      `Skipping topic filter; topic value is empty after trimming: ${topic}`
     );
   }
 
@@ -495,17 +522,25 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
 
       assistantResults = await primaryAssistantRetriever.retrieve(query);
 
-      // Fallback: if topic-filtered retrieval returns zero, retry without topic
+      // Fallback: if topic-filtered retrieval returns zero, try normalized topic
       if (assistantResults.length === 0 && detectedTopic) {
-        console.log(`Assistant retriever returned 0 results with topic filter "${detectedTopic}". Falling back to assistantId-only retrieval.`);
-        const fallbackRetriever = createAssistantRetriever({
-          index_assistant_documents,
-          assistantId,
-          topic: null,
-        });
-        assistantResults = await fallbackRetriever.retrieve(query);
+        const normalizedTopic = normalizeTopicValue(detectedTopic);
+        if (normalizedTopic && normalizedTopic !== detectedTopic) {
+          console.log(
+            `Assistant retriever returned 0 results with topic filter "${detectedTopic}". Retrying with normalized topic "${normalizedTopic}".`
+          );
+          const normalizedRetriever = createAssistantRetriever({
+            index_assistant_documents,
+            assistantId,
+            topic: normalizedTopic,
+          });
+          assistantResults = await normalizedRetriever.retrieve(query);
+        }
       }
-      console.log(`Assistant retriever returned ${assistantResults.length} documents`);
+
+      console.log(
+        `Assistant retriever returned ${assistantResults.length} documents`
+      );
     }
 
     // Filter and limit results separately
@@ -514,23 +549,43 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
       RETRIEVER_LIMITS.chat.minScore,
       RETRIEVER_LIMITS.chat.maxItems
     );
-    const filteredAssistant = filterAndTrimResults(
+    let filteredAssistant = filterAndTrimResults(
       assistantResults,
       RETRIEVER_LIMITS.assistant.minScore,
       RETRIEVER_LIMITS.assistant.maxItems
     );
 
+    // If we still have no assistant docs after filtering, keep the top matches.
+    if (!filteredAssistant.length && assistantResults.length) {
+      console.log(
+        `Assistant results below minScore ${RETRIEVER_LIMITS.assistant.minScore}; keeping top results without score filter.`
+      );
+      filteredAssistant = filterAndTrimResults(
+        assistantResults,
+        0,
+        RETRIEVER_LIMITS.assistant.maxItems
+      );
+    }
+
     // Combine filtered results: chat first, then assistant docs
     const filteredResults = [...filteredChat, ...filteredAssistant];
     const filteredStats = {
-      assistant: { total: assistantResults.length, kept: filteredAssistant.length },
+      assistant: {
+        total: assistantResults.length,
+        kept: filteredAssistant.length,
+      },
       chat: { total: chatResults.length, kept: filteredChat.length },
     };
 
     try {
       const formatted = filteredResults.slice(0, 5).map((doc) => ({
         score: doc?.score || 0,
-        metadata: doc?.node?.metadata || {},
+        metadata: {
+          topic: doc?.node?.metadata?.topic,
+          source: doc?.node?.metadata?.source,
+          assistantId: doc?.node?.metadata?.assistantId,
+          text: doc?.node?.text || "",
+        },
         text:
           (doc?.node?.text || "").length > 200
             ? `${doc.node.text.substring(0, 200)}...`
@@ -561,6 +616,16 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
       console.log(
         `Logging all assistant-documents results (${assistantDocResults.length})`
       );
+      const topicCounts = assistantDocResults.reduce((acc, doc) => {
+        const topic = (doc?.node?.metadata?.topic || "Unknown").toString().trim();
+        acc[topic] = (acc[topic] || 0) + 1;
+        return acc;
+      }, {});
+      const sortedTopics = Object.entries(topicCounts).sort((a, b) => b[1] - a[1]);
+      console.log("Assistant-documents topic counts:");
+      sortedTopics.forEach(([topic, count]) => {
+        console.log(`- ${topic}: ${count}`);
+      });
       logRetrieverSamples(assistantDocResults, "assistantDocsOnly", 5);
     } else {
       console.log("No assistant-documents results to log.");
