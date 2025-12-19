@@ -26,7 +26,7 @@ const conversationTopicCache = new Map();
 
 const RETRIEVER_LIMITS = {
   assistant: {
-    topK: 24,
+    topK: 40,
     minScore: 0.3,
     maxItems: 16,
   },
