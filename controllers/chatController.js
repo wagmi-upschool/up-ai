@@ -74,7 +74,6 @@ function filterAndTrimResults(nodes = [], minScore = 0, maxItems = null) {
   return maxItems ? filtered.slice(0, maxItems) : filtered;
 }
 
-
 async function streamDirectLLM({ res, systemPrompt, query, assistantConfig }) {
   const llm = new OpenAI({
     azure: {
@@ -137,9 +136,7 @@ function normalizeInputOptions(options = []) {
         ? {
             raw,
             normalized: raw.toLocaleLowerCase("tr"),
-            matchKey: (
-              normalizeTopicValue(raw) || raw
-            ).toLocaleLowerCase("tr"),
+            matchKey: (normalizeTopicValue(raw) || raw).toLocaleLowerCase("tr"),
           }
         : null;
     })
@@ -149,9 +146,7 @@ function normalizeInputOptions(options = []) {
 function matchOptionFromText(text, normalizedOptions = []) {
   if (!text || !normalizedOptions.length) return null;
   const rawText = text.toString().trim();
-  const normalizedText = (
-    normalizeTopicValue(rawText) || rawText
-  )
+  const normalizedText = (normalizeTopicValue(rawText) || rawText)
     .toLocaleLowerCase("tr")
     .trim();
 
@@ -301,9 +296,7 @@ function createAssistantRetriever({
       value: rawTopic,
       operator: "==",
     });
-    console.log(
-      `Filtering assistant documents by topic: ${rawTopic}`
-    );
+    console.log(`Filtering assistant documents by topic: ${rawTopic}`);
   } else if (topic) {
     console.log(
       `Skipping topic filter; topic value is empty after trimming: ${topic}`
@@ -617,11 +610,15 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
         `Logging all assistant-documents results (${assistantDocResults.length})`
       );
       const topicCounts = assistantDocResults.reduce((acc, doc) => {
-        const topic = (doc?.node?.metadata?.topic || "Unknown").toString().trim();
+        const topic = (doc?.node?.metadata?.topic || "Unknown")
+          .toString()
+          .trim();
         acc[topic] = (acc[topic] || 0) + 1;
         return acc;
       }, {});
-      const sortedTopics = Object.entries(topicCounts).sort((a, b) => b[1] - a[1]);
+      const sortedTopics = Object.entries(topicCounts).sort(
+        (a, b) => b[1] - a[1]
+      );
       console.log("Assistant-documents topic counts:");
       sortedTopics.forEach(([topic, count]) => {
         console.log(`- ${topic}: ${count}`);
@@ -648,22 +645,54 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
     } else {
       console.log("Using retriever response with context");
 
-      // Build context from retrieved documents
-      const contextParts = filteredResults.map((doc, idx) => {
-        const text = doc?.node?.text || "";
-        return `[Document ${idx + 1}]:\n${text}`;
-      });
-      const retrievedContext = contextParts.join("\n\n");
+      const retrievedChunks = filteredAssistant
+        .map((doc, idx) => {
+          const text = (doc?.node?.text || "").trim();
+          return text ? `[Document ${idx + 1}]\n${text}` : "";
+        })
+        .filter(Boolean)
+        .join("\n\n");
 
-      // Build system prompt with retrieved context
-      const systemPromptWithContext = `${baseSystemPrompt}
+      const userPromptMessage = retrievedChunks
+        ? {
+            role: "user",
+            content: `
+RETRIEVED DOCUMENTATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${retrievedChunks}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
----
-İlgili Bilgiler:
-${retrievedContext}
----
+TASK: Use ONLY the documentation above to answer the following question.
+If the documentation doesn't contain sufficient information, explicitly state what's missing.
+Do not use any external knowledge.
 
-Yukarıdaki bilgileri kullanarak kullanıcının sorusuna kapsamlı ve eğitici bir şekilde cevap ver.`;
+USER QUESTION:
+${query}
+`,
+          }
+        : {
+            role: "user",
+            content: query,
+          };
+
+      const chatHistoryMessages = filteredChat
+        .map((doc) => {
+          const role = (doc?.node?.metadata?.role || "user").toLowerCase();
+          const content = (doc?.node?.text || "").trim();
+          const timestamp =
+            doc?.node?.metadata?.timestamp || doc?.node?.metadata?.createdAt;
+          return { role, content, timestamp };
+        })
+        .filter((message) => message.content)
+        .sort((a, b) => {
+          const aTime = new Date(a.timestamp || 0).getTime();
+          const bTime = new Date(b.timestamp || 0).getTime();
+          return aTime - bTime;
+        })
+        .map(({ content }) => ({
+          role: "memory",
+          content,
+        }));
 
       try {
         const llm = new OpenAI({
@@ -686,15 +715,17 @@ Yukarıdaki bilgileri kullanarak kullanıcının sorusuna kapsamlı ve eğitici 
           messages: [
             {
               role: "system",
-              content: systemPromptWithContext,
+              content: baseSystemPrompt,
             },
-            {
-              role: "user",
-              content: query,
-            },
+            ...chatHistoryMessages,
+            userPromptMessage,
           ],
           stream: true,
         });
+
+        res.write(
+          `Kullanıcı kademesi: ${detectedTopic || "tespit edilemedi"}\n\n`
+        );
 
         for await (const chunk of responseStream) {
           fullOutput += chunk.delta;
