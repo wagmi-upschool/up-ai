@@ -723,9 +723,9 @@ ${query}
           stream: true,
         });
 
-        res.write(
-          `Kullanıcı kademesi: ${detectedTopic || "tespit edilemedi"}\n\n`
-        );
+        // res.write(
+        //   `Kullanıcı kademesi: ${detectedTopic || "tespit edilemedi"}\n\n`
+        // );
 
         for await (const chunk of responseStream) {
           fullOutput += chunk.delta;
