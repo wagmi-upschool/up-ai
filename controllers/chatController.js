@@ -6,7 +6,7 @@ import {
   OpenAIEmbedding,
   VectorIndexRetriever,
 } from "llamaindex";
-import { GetCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { AssistantInputOptionsService } from "../services/assistantInputOptionsService.js";
 import dotenv from "dotenv";
@@ -30,13 +30,7 @@ const RETRIEVER_LIMITS = {
     minScore: 0.3,
     maxItems: 16,
   },
-  chat: {
-    topK: 20,
-    minScore: 0.0, // Chat history should always be included regardless of similarity
-    maxItems: 10,
-  },
 };
-
 // Helper function for timing measurements
 function getTimeElapsed(startTime) {
   const elapsed = process.hrtime(startTime);
@@ -74,7 +68,107 @@ function filterAndTrimResults(nodes = [], minScore = 0, maxItems = null) {
   return maxItems ? filtered.slice(0, maxItems) : filtered;
 }
 
-async function streamDirectLLM({ res, systemPrompt, query, assistantConfig }) {
+function normalizeConversationMessages(items = []) {
+  return items
+    .map((item) => {
+      const content = (item?.content ?? item?.message ?? "").toString().trim();
+      if (!content) return null;
+      const timestamp = item?.createdAt ?? item?.timestamp ?? null;
+      return {
+        content,
+        role: item?.role || "user",
+        timestamp,
+        metadata: {
+          assistantId: item?.assistantId ?? null,
+          assistantGroupId: item?.assistantGroupId ?? null,
+          userId: item?.userId ?? null,
+          identifier: item?.identifier ?? item?.id ?? null,
+          type: item?.type ?? null,
+          isGptSuitable:
+            typeof item?.isGptSuitable === "boolean"
+              ? item.isGptSuitable
+              : null,
+        },
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildHistoryNodes(messages = []) {
+  return messages.map((message) => ({
+    node: {
+      text: message.content,
+      metadata: {
+        role: message.role,
+        timestamp: message.timestamp,
+        createdAt: message.timestamp,
+        assistantId: message.metadata.assistantId,
+        assistantGroupId: message.metadata.assistantGroupId,
+        userId: message.metadata.userId,
+        source: "chat-messages",
+      },
+    },
+    score: 0,
+  }));
+}
+
+function buildChatHistoryMessages(messages = [], maxItems) {
+  const resolved =
+    typeof maxItems === "number" ? messages.slice(-maxItems) : messages;
+  return resolved.map((message) => ({
+    role: "memory",
+    content: message.content,
+  }));
+}
+
+async function fetchConversationMessages(conversationId, stage, limit) {
+  if (!conversationId) return [];
+  const env = stage ?? process.env.STAGE;
+
+  try {
+    let items = [];
+    let lastEvaluatedKey;
+
+    do {
+      const params = {
+        TableName: `UpConversationMessage-${env}`,
+        KeyConditionExpression: "conversationId = :conversationId",
+        ExpressionAttributeValues: {
+          ":conversationId": conversationId,
+        },
+        ScanIndexForward: false,
+        ExclusiveStartKey: lastEvaluatedKey,
+      };
+
+      if (typeof limit === "number") {
+        const remaining = limit - items.length;
+        if (remaining <= 0) break;
+        params.Limit = remaining;
+      }
+
+      const command = new QueryCommand(params);
+      const result = await dynamoDbClient.send(command);
+      if (result.Items && result.Items.length > 0) {
+        items = items.concat(result.Items);
+      }
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    if (!items.length) return [];
+    return items.reverse();
+  } catch (error) {
+    console.error("Error fetching chat messages from DynamoDB:", error);
+    return null;
+  }
+}
+
+async function streamDirectLLM({
+  res,
+  systemPrompt,
+  query,
+  assistantConfig,
+  chatHistoryMessages = [],
+}) {
   const llm = new OpenAI({
     azure: {
       endpoint: process.env.AZURE_OPENAI_ENDPOINT,
@@ -97,6 +191,7 @@ async function streamDirectLLM({ res, systemPrompt, query, assistantConfig }) {
         role: "system",
         content: systemPrompt,
       },
+      ...chatHistoryMessages,
       {
         role: "user",
         content: query,
@@ -176,7 +271,7 @@ function matchOptionFromText(text, normalizedOptions = []) {
 function detectOptionFromHistory(historyNodes = [], normalizedOptions = []) {
   if (!historyNodes.length || !normalizedOptions.length) return null;
 
-  // Prefer the latest user messages, then fall back to any message content
+  // Prefer the earliest user messages, then fall back to any message content
   const sorted = [...historyNodes].sort((a, b) => {
     const tsA = new Date(
       a?.node?.metadata?.timestamp || a?.node?.metadata?.createdAt || 0
@@ -184,7 +279,7 @@ function detectOptionFromHistory(historyNodes = [], normalizedOptions = []) {
     const tsB = new Date(
       b?.node?.metadata?.timestamp || b?.node?.metadata?.createdAt || 0
     ).getTime();
-    return tsB - tsA;
+    return tsA - tsB;
   });
 
   const tryMatch = (nodes) => {
@@ -247,17 +342,7 @@ async function initializeSettings(config) {
   });
 }
 
-async function createIndices() {
-  const pcvs_chat = new PineconeVectorStore({
-    indexName: "chat-messages",
-    chunkSize: 100,
-    storesText: true,
-    embeddingModel: new OpenAIEmbedding({
-      model: "text-embedding-3-small",
-      azure: getAzureEmbeddingOptions(),
-    }),
-  });
-
+async function createAssistantIndex() {
   const pcvs_assistant = new PineconeVectorStore({
     indexName: "assistant-documents",
     chunkSize: 100,
@@ -268,12 +353,11 @@ async function createIndices() {
     }),
   });
 
-  const index_chat_messages = await VectorStoreIndex.fromVectorStore(pcvs_chat);
   const index_assistant_documents = await VectorStoreIndex.fromVectorStore(
     pcvs_assistant
   );
 
-  return { index_chat_messages, index_assistant_documents };
+  return { index_assistant_documents };
 }
 
 function createAssistantRetriever({
@@ -310,23 +394,6 @@ function createAssistantRetriever({
       filters,
     },
     similarityTopK: RETRIEVER_LIMITS.assistant.topK,
-  });
-}
-
-function createChatRetriever({ index_chat_messages, conversationId }) {
-  return new VectorIndexRetriever({
-    index: index_chat_messages,
-    includeValues: true,
-    filters: {
-      filters: [
-        {
-          key: "conversationId",
-          value: conversationId,
-          operator: "==",
-        },
-      ],
-    },
-    similarityTopK: RETRIEVER_LIMITS.chat.topK,
   });
 }
 
@@ -393,9 +460,8 @@ export async function handleLLMStream(req, res) {
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Transfer-Encoding", "chunked");
 
-    // Create indices for both chat messages and assistant documents
-    const { index_chat_messages, index_assistant_documents } =
-      await createIndices();
+    // Create index for assistant documents
+    const { index_assistant_documents } = await createAssistantIndex();
 
     // Detect topic from current query or recover from prior conversation turns
     const normalizedConversationId =
@@ -411,24 +477,28 @@ export async function handleLLMStream(req, res) {
         : null;
     let priorUserMessages = 0;
     let historyNodes = [];
+    let conversationMessages = [];
     if (normalizedConversationId) {
-      try {
-        const chatHistoryRetriever = createChatRetriever({
-          index_chat_messages,
-          conversationId: normalizedConversationId,
-        });
-        historyNodes = await chatHistoryRetriever.retrieve(
-          "conversation history context"
+      const items = await fetchConversationMessages(
+        normalizedConversationId,
+        stage,
+        null
+      );
+
+      if (!items) {
+        console.warn(
+          "Could not determine prior user messages, assuming not first message."
         );
+        priorUserMessages = 1; // avoid applying topic filter on uncertainty
+      } else {
+        conversationMessages = normalizeConversationMessages(items);
+        historyNodes = buildHistoryNodes(conversationMessages);
         priorUserMessages = historyNodes.filter(
           (n) => (n?.node?.metadata?.role || "").toLowerCase() === "user"
         ).length;
-      } catch (err) {
-        console.warn(
-          "Could not determine prior user messages, assuming not first message:",
-          err?.message
+        console.log(
+          `Fetched ${conversationMessages.length} chat messages from DynamoDB`
         );
-        priorUserMessages = 1; // avoid applying topic filter on uncertainty
       }
     }
     const isFirstUserMessage = priorUserMessages === 0;
@@ -464,13 +534,6 @@ export async function handleLLMStream(req, res) {
           }
         }
 
-        if (!detectedTopic && normalizedOptions.length) {
-          console.log(
-            isFirstUserMessage
-              ? "First user message did not match any input option; no topic filter applied."
-              : "No topic match in current query or history; skipping topic filter."
-          );
-        }
       } catch (err) {
         console.error("Error detecting topic from input options:", err);
       }
@@ -483,6 +546,14 @@ export async function handleLLMStream(req, res) {
       );
     }
 
+    if (!detectedTopic && normalizedOptions.length) {
+      console.log(
+        isFirstUserMessage
+          ? "First user message did not match any input option; no topic filter applied."
+          : "No topic match in current query or history; skipping topic filter."
+      );
+    }
+
     if (detectedTopic && normalizedConversationId) {
       conversationTopicCache.set(normalizedConversationId, detectedTopic);
     }
@@ -491,19 +562,9 @@ export async function handleLLMStream(req, res) {
 Kullanıcı kademesi: ${detectedTopic || ""}
 Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.`;
 
-    // Retrieve chat messages and assistant docs separately
-    let chatResults = [];
+    // Retrieve assistant docs (chat history already fetched from DynamoDB)
     let assistantResults = [];
-
-    // Get chat history if we have a conversation ID
-    if (normalizedConversationId) {
-      const retriever_chat = createChatRetriever({
-        index_chat_messages,
-        conversationId: normalizedConversationId,
-      });
-      chatResults = await retriever_chat.retrieve(query);
-      console.log(`Chat retriever returned ${chatResults.length} messages`);
-    }
+    const chatHistoryMessages = buildChatHistoryMessages(conversationMessages);
 
     // Get assistant documents if we have an assistant ID
     if (assistantId) {
@@ -536,12 +597,7 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
       );
     }
 
-    // Filter and limit results separately
-    const filteredChat = filterAndTrimResults(
-      chatResults,
-      RETRIEVER_LIMITS.chat.minScore,
-      RETRIEVER_LIMITS.chat.maxItems
-    );
+    // Filter and limit assistant results
     let filteredAssistant = filterAndTrimResults(
       assistantResults,
       RETRIEVER_LIMITS.assistant.minScore,
@@ -560,18 +616,8 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
       );
     }
 
-    // Combine filtered results: chat first, then assistant docs
-    const filteredResults = [...filteredChat, ...filteredAssistant];
-    const filteredStats = {
-      assistant: {
-        total: assistantResults.length,
-        kept: filteredAssistant.length,
-      },
-      chat: { total: chatResults.length, kept: filteredChat.length },
-    };
-
     try {
-      const formatted = filteredResults.slice(0, 5).map((doc) => ({
+      const formatted = filteredAssistant.slice(0, 5).map((doc) => ({
         score: doc?.score || 0,
         metadata: {
           topic: doc?.node?.metadata?.topic,
@@ -590,21 +636,17 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
       );
 
       console.log(
-        `Retrieval counts (raw) -> assistant-documents: ${assistantResults.length}, chat-messages: ${chatResults.length}`
+        `Retrieval counts (assistant-documents raw/filtered): ${assistantResults.length}/${filteredAssistant.length}`
       );
       console.log(
-        `Retrieval counts (filtered) -> assistant-documents: ${filteredStats.assistant.kept}/${filteredStats.assistant.total}, chat-messages: ${filteredStats.chat.kept}/${filteredStats.chat.total}`
+        `Chat history (DynamoDB): ${conversationMessages.length} messages, using ${chatHistoryMessages.length}`
       );
     } catch (err) {
       console.error("Error formatting retrieved results:", err);
     }
     //logRetrieverSamples(results, "retrieverResults", 5);
 
-    const assistantDocResults = filteredResults.filter(
-      (doc) =>
-        (doc?.node?.metadata?.source || "").toLowerCase() ===
-        "assistant-documents"
-    );
+    const assistantDocResults = filteredAssistant;
     if (assistantDocResults.length) {
       console.log(
         `Logging all assistant-documents results (${assistantDocResults.length})`
@@ -628,17 +670,18 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
       console.log("No assistant-documents results to log.");
     }
 
-    const hasRetrieverResults = filteredResults.length > 0;
+    const hasAssistantDocs = filteredAssistant.length > 0;
     let fullOutput = "";
     let hasWritten = false;
 
-    if (!hasRetrieverResults) {
-      console.log("Using direct LLM response (no retriever results)");
+    if (!hasAssistantDocs) {
+      console.log("Using direct LLM response (no assistant documents)");
       const directResult = await streamDirectLLM({
         res,
         systemPrompt: baseSystemPrompt,
         query,
         assistantConfig,
+        chatHistoryMessages,
       });
       fullOutput = directResult.fullOutput;
       hasWritten = directResult.hasWritten;
@@ -674,25 +717,6 @@ ${query}
             role: "user",
             content: query,
           };
-
-      const chatHistoryMessages = filteredChat
-        .map((doc) => {
-          const role = (doc?.node?.metadata?.role || "user").toLowerCase();
-          const content = (doc?.node?.text || "").trim();
-          const timestamp =
-            doc?.node?.metadata?.timestamp || doc?.node?.metadata?.createdAt;
-          return { role, content, timestamp };
-        })
-        .filter((message) => message.content)
-        .sort((a, b) => {
-          const aTime = new Date(a.timestamp || 0).getTime();
-          const bTime = new Date(b.timestamp || 0).getTime();
-          return aTime - bTime;
-        })
-        .map(({ content }) => ({
-          role: "memory",
-          content,
-        }));
 
       try {
         const llm = new OpenAI({
@@ -743,6 +767,7 @@ ${query}
             systemPrompt: baseSystemPrompt,
             query,
             assistantConfig,
+            chatHistoryMessages,
           });
           fullOutput = directResult.fullOutput;
           hasWritten = directResult.hasWritten;
