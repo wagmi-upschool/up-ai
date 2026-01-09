@@ -321,6 +321,22 @@ function logRetrieverSamples(results, label = "results", maxItems = 3) {
   }
 }
 
+function logConversationMessages(messages = [], label = "chat-history") {
+  try {
+    messages.forEach((message, idx) => {
+      const payload = {
+        role: message.role,
+        timestamp: message.timestamp,
+        content: message.content,
+        metadata: message.metadata,
+      };
+      console.log(`[${label} ${idx}] ${JSON.stringify(payload)}`);
+    });
+  } catch (err) {
+    console.error("Error logging conversation messages:", err);
+  }
+}
+
 async function initializeSettings(config) {
   const { setEnvs } = await import("@llamaindex/env");
   setEnvs(process.env);
@@ -533,7 +549,6 @@ export async function handleLLMStream(req, res) {
             );
           }
         }
-
       } catch (err) {
         console.error("Error detecting topic from input options:", err);
       }
@@ -565,6 +580,9 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
     // Retrieve assistant docs (chat history already fetched from DynamoDB)
     let assistantResults = [];
     const chatHistoryMessages = buildChatHistoryMessages(conversationMessages);
+    if (conversationMessages.length) {
+      //logConversationMessages(conversationMessages, "dynamodb-chat");
+    }
 
     // Get assistant documents if we have an assistant ID
     if (assistantId) {
@@ -700,14 +718,10 @@ Bu bilgiyi kalıcı bağlam olarak kabul et ve yanıtlarını buna göre uyumla.
         ? {
             role: "user",
             content: `
-RETRIEVED DOCUMENTATION:
+RETRIEVED info:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ${retrievedChunks}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-TASK: Use ONLY the documentation above to answer the following question.
-If the documentation doesn't contain sufficient information, explicitly state what's missing.
-Do not use any external knowledge.
 
 USER QUESTION:
 ${query}
