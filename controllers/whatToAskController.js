@@ -66,26 +66,15 @@ function replacePatterns(text) {
   return text.replace(regex, "");
 }
 
-// Helper function to configure Azure options
-function getAzureEmbeddingOptions() {
-  return {
-    endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-    deployment: "text-embedding-3-small",
-    apiKey: process.env.AZURE_OPENAI_KEY,
-  };
-}
-
 // Initialize OpenAI settings based on assistant configuration
 async function initializeSettings(config) {
   const { setEnvs } = await import("@llamaindex/env");
   setEnvs(process.env);
+
   Settings.llm = new OpenAI({
-    azure: {
-      apiKey: process.env.AZURE_OPENAI_KEY,
-      endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-      deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-      model: process.env.MODEL,
-    },
+    model: process.env.MODEL,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_BASE_URL },
     additionalChatOptions: {
       frequency_penalty: config.frequencyPenalty,
       presence_penalty: config.presencePenalty,
@@ -94,32 +83,34 @@ async function initializeSettings(config) {
     temperature: config.temperature,
     topP: config.topP,
   });
+
   Settings.embedModel = new OpenAIEmbedding({
-    model: "text-embedding-3-small",
-    azure: getAzureEmbeddingOptions(),
+    model: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_EMBEDDING_BASE_URL },
   });
 }
 
 // Create and return separate indices for chat messages and assistant documents
 async function createIndices() {
+  const embeddingModel = new OpenAIEmbedding({
+    model: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_EMBEDDING_BASE_URL },
+  });
+
   const pcvs_chat = new PineconeVectorStore({
     indexName: "chat-messages",
     chunkSize: process.env.CHUNK_SIZE,
     storesText: true,
-    embeddingModel: new OpenAIEmbedding({
-      model: "text-embedding-3-small",
-      azure: getAzureEmbeddingOptions(),
-    }),
+    embeddingModel,
   });
 
   const pcvs_assistant = new PineconeVectorStore({
     indexName: "assistant-documents",
     chunkSize: process.env.CHUNK_SIZE,
     storesText: true,
-    embeddingModel: new OpenAIEmbedding({
-      model: "text-embedding-3-small",
-      azure: getAzureEmbeddingOptions(),
-    }),
+    embeddingModel,
   });
 
   const index_chat_messages = await VectorStoreIndex.fromVectorStore(pcvs_chat);
