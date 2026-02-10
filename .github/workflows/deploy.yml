@@ -78,11 +78,34 @@ jobs:
             --task-definition "${TASK_FAMILY}" \
             --query "taskDefinition" > task-def.json
 
-          # 2. Filter out read-only fields AND update the image in one pass
+          # 2. Filter out read-only fields, update image, and migrate env vars
           # We remove fields that AWS ECS RegisterTaskDefinition does not accept.
+          # Env var changes (Azure OpenAI v1 migration):
+          #   Removed: AZURE_OPENAI_API_KEY, OPENAI_API_TYPE, AZURE_OPENAI_API_DEPLOYMENT_NAME, AZURE_OPENAI_API_VERSION
+          #   Renamed: AZURE_OPENAI_ENDPOINT -> AZURE_OPENAI_BASE_URL
+          #   Added:   AZURE_OPENAI_EMBEDDING_BASE_URL, AZURE_OPENAI_EMBEDDING_DEPLOYMENT
+          #   Changed: MODEL -> gpt-4.1-mini
           jq --arg IMG "${IMAGE_TAG}" --arg NAME "${CONTAINER_NAME}" '
             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
-            .containerDefinitions |= map(if .name == $NAME then .image = $IMG else . end)
+            .containerDefinitions |= map(
+              if .name == $NAME then
+                .image = $IMG |
+                .environment |= (
+                  # Remove obsolete env vars
+                  map(select(.name != "AZURE_OPENAI_API_KEY" and .name != "OPENAI_API_TYPE" and .name != "AZURE_OPENAI_API_DEPLOYMENT_NAME" and .name != "AZURE_OPENAI_API_VERSION")) |
+
+                  # Rename AZURE_OPENAI_ENDPOINT -> AZURE_OPENAI_BASE_URL
+                  map(if .name == "AZURE_OPENAI_ENDPOINT" then .name = "AZURE_OPENAI_BASE_URL" else . end) |
+
+                  # Update MODEL value to gpt-4.1-mini
+                  map(if .name == "MODEL" then .value = "gpt-4.1-mini" else . end) |
+
+                  # Add new env vars if not already present
+                  (if any(.[]; .name == "AZURE_OPENAI_EMBEDDING_BASE_URL") then . else . + [{"name": "AZURE_OPENAI_EMBEDDING_BASE_URL", "value": "https://uptechnew-resource.openai.azure.com/openai/v1/"}] end) |
+                  (if any(.[]; .name == "AZURE_OPENAI_EMBEDDING_DEPLOYMENT") then . else . + [{"name": "AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "value": "text-embedding-3-small"}] end)
+                )
+              else . end
+            )
           ' task-def.json > new-task-def.json
 
           # 3. Register the new task definition

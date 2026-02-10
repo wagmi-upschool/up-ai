@@ -18,25 +18,16 @@ import { createObjectCsvWriter } from "csv-writer"; // npm install csv-writer
 
 dotenv.config(); // Load environment variables
 
-// Function to configure Azure Embedding options
-function getAzureEmbeddingOptions() {
-  return {
-    endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-    deployment: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME, // Updated
-    apiKey: process.env.AZURE_OPENAI_KEY,
-  };
-}
-
 // Initialize OpenAI and Pinecone settings
 async function initializeSettings(config) {
   const { setEnvs } = await import("@llamaindex/env");
-  setEnvs(process.env); // Set environment variables for LlamaIndex
+  setEnvs(process.env);
 
   Settings.llm = new OpenAI({
     model: process.env.MODEL,
-    deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_BASE_URL },
     additionalChatOptions: {
-      deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
       frequency_penalty: config.frequencyPenalty,
       presence_penalty: config.presencePenalty,
       stream: config.stream ? config.stream : undefined,
@@ -46,8 +37,9 @@ async function initializeSettings(config) {
   });
 
   Settings.embedModel = new OpenAIEmbedding({
-    model: "text-embedding-3-small",
-    azure: getAzureEmbeddingOptions(),
+    model: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_EMBEDDING_BASE_URL },
   });
 }
 
@@ -312,8 +304,9 @@ const pcvs_assistant_documents = new PineconeVectorStore({
   chunkSize: 100,
   storesText: true,
   embeddingModel: new OpenAIEmbedding({
-    model: "text-embedding-3-small",
-    azure: getAzureEmbeddingOptions(),
+    model: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_EMBEDDING_BASE_URL },
   }),
 });
 

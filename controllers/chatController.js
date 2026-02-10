@@ -44,15 +44,6 @@ function replacePatterns(text) {
   return text.replace(regex, "");
 }
 
-// Helper function to configure Azure options
-function getAzureEmbeddingOptions() {
-  return {
-    endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-    deployment: "text-embedding-3-small",
-    apiKey: process.env.AZURE_OPENAI_KEY,
-  };
-}
-
 function logRetrieverSamples(results, label = "results", maxItems = 3) {
   try {
     results.slice(0, maxItems).forEach((doc, idx) => {
@@ -79,11 +70,12 @@ function logRetrieverSamples(results, label = "results", maxItems = 3) {
 async function initializeSettings(config) {
   const { setEnvs } = await import("@llamaindex/env");
   setEnvs(process.env);
+
   Settings.llm = new OpenAI({
     model: process.env.MODEL,
-    deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_BASE_URL },
     additionalChatOptions: {
-      deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
       frequency_penalty: config.frequencyPenalty,
       presence_penalty: config.presencePenalty,
       stream: true,
@@ -91,31 +83,33 @@ async function initializeSettings(config) {
     temperature: config.temperature,
     topP: config.topP,
   });
+
   Settings.embedModel = new OpenAIEmbedding({
-    model: "text-embedding-3-small",
-    azure: getAzureEmbeddingOptions(),
+    model: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_EMBEDDING_BASE_URL },
   });
 }
 
 async function createIndices() {
+  const embeddingModel = new OpenAIEmbedding({
+    model: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+    apiKey: process.env.AZURE_OPENAI_KEY,
+    additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_EMBEDDING_BASE_URL },
+  });
+
   const pcvs_chat = new PineconeVectorStore({
     indexName: "chat-messages",
     chunkSize: 100,
     storesText: true,
-    embeddingModel: new OpenAIEmbedding({
-      model: "text-embedding-3-small",
-      azure: getAzureEmbeddingOptions(),
-    }),
+    embeddingModel,
   });
 
   const pcvs_assistant = new PineconeVectorStore({
     indexName: "assistant-documents",
     chunkSize: 100,
     storesText: true,
-    embeddingModel: new OpenAIEmbedding({
-      model: "text-embedding-3-small",
-      azure: getAzureEmbeddingOptions(),
-    }),
+    embeddingModel,
   });
 
   const index_chat_messages = await VectorStoreIndex.fromVectorStore(pcvs_chat);
@@ -372,12 +366,9 @@ export async function handleLLMStream(req, res) {
     if (!conversationId || conversationId === "null" || results.length === 0) {
       console.log("Using direct LLM response");
       const llm = new OpenAI({
-        azure: {
-          endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-          deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-          apiKey: process.env.AZURE_OPENAI_KEY,
-        },
         model: process.env.MODEL,
+        apiKey: process.env.AZURE_OPENAI_KEY,
+        additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_BASE_URL },
         additionalChatOptions: {
           frequency_penalty: assistantConfig.frequencyPenalty,
           presence_penalty: assistantConfig.presencePenalty,
@@ -413,12 +404,9 @@ export async function handleLLMStream(req, res) {
         "tree_summarize",
         {
           llm: new OpenAI({
-            azure: {
-              endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-              deployment: process.env.AZURE_OPENAI_API_DEPLOYMENT_NAME,
-              apiKey: process.env.AZURE_OPENAI_KEY,
-            },
             model: process.env.MODEL,
+            apiKey: process.env.AZURE_OPENAI_KEY,
+            additionalSessionOptions: { baseURL: process.env.AZURE_OPENAI_BASE_URL },
             additionalChatOptions: {
               frequency_penalty: assistantConfig.frequencyPenalty,
               presence_penalty: assistantConfig.presencePenalty,
